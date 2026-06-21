@@ -1,4 +1,5 @@
 import tkinter as tk
+import tkinter.font as tkfont
 
 
 class ManualeFrame(tk.Frame):
@@ -19,9 +20,27 @@ class ManualeFrame(tk.Frame):
         self.axis_labels = {}
         self.x_speed_mm_s = tk.DoubleVar(value=10.0)
         self.y_speed_mm_s = tk.DoubleVar(value=10.0)
+        self.dro_font_family = self.find_dro_font()
         self.build_ui()
         self.refresh_axes()
         self.send_current_command(send_semi=True)
+
+    def find_dro_font(self):
+        """Sceglie un font a 7 segmenti, con fallback monospaziato."""
+        available = {name.lower(): name for name in tkfont.families(self)}
+        preferred = (
+            "DSEG7 Classic",
+            "DSEG7 Modern",
+            "Digital-7",
+            "DS-Digital",
+            "LCDMono2",
+            "DejaVu Sans Mono",
+            "Courier New",
+        )
+        for family in preferred:
+            if family.lower() in available:
+                return available[family.lower()]
+        return "TkFixedFont"
 
     def build_ui(self):
         self.grid_rowconfigure(0, minsize=76, weight=0)
@@ -32,7 +51,7 @@ class ManualeFrame(tk.Frame):
         header = tk.Frame(self, bg=self.bg, padx=14, pady=6)
         header.grid(row=0, column=0, sticky="ew")
         for i in range(3):
-            header.grid_columnconfigure(i, weight=1)
+            header.grid_columnconfigure(i, weight=1, uniform="axis_display")
 
         for idx, axis in enumerate(("X", "Y", "Z")):
             box = tk.Frame(header, bg="#1a1a1a", highlightbackground="#333333",
@@ -40,9 +59,13 @@ class ManualeFrame(tk.Frame):
             box.grid(row=0, column=idx, sticky="ew", padx=6)
             tk.Label(box, text=axis, font=("Arial", 14, "bold"),
                      fg="#cfcfcf", bg="#1a1a1a").pack()
-            lbl = tk.Label(box, text="000,000", font=("Courier New", 25, "bold"),
-                           fg="white", bg="#1a1a1a")
-            lbl.pack()
+            # La larghezza comprende anche l'eventuale segno meno. L'ancoraggio
+            # a destra mantiene ferme unita, decimali e pannelli degli altri assi.
+            lbl = tk.Label(box, text="000,000",
+                           font=(self.dro_font_family, 25, "bold"),
+                           width=9, anchor="e", padx=4,
+                           fg="#7CFF6B", bg="#1a1a1a")
+            lbl.pack(fill="x")
             self.axis_labels[axis] = lbl
 
         body = tk.Frame(self, bg=self.bg, padx=16, pady=4)
