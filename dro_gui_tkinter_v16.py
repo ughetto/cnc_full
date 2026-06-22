@@ -9,6 +9,8 @@ except Exception:
     serial = None
 
 from manuale_v8 import ManualeFrame
+from settings_frame import SettingsFrame
+from settings_store import DEFAULT_CONFIG_PATH, load_settings, save_settings
 try:
     from spianatura_xy_v5 import SpianaturaXYFrame
 except Exception:
@@ -48,6 +50,11 @@ class DROApp(tk.Tk):
         self.last_semi_cmd = {"x": 800.0, "y": 800.0}
         self.last_manual_send_time = 0.0
         self.manual_keepalive_interval_s = 0.20
+
+        self.settings_path = DEFAULT_CONFIG_PATH
+        (self.pulses_per_mm,
+         self.settings_notice,
+         self.using_provisional_settings) = load_settings(self.settings_path)
 
         self.container = tk.Frame(self, bg="#101010")
         self.container.pack(fill="both", expand=True)
@@ -171,6 +178,17 @@ class DROApp(tk.Tk):
                       activebackground="#4d96ff", activeforeground="white",
                       relief="flat", bd=0, padx=30, pady=22, width=18).grid(row=i, column=0, pady=10)
 
+        if self.using_provisional_settings:
+            tk.Label(frame, text="SETTINGS: DEFAULT PROVVISORI - VERIFICARE IMPULSI/MM",
+                     font=("Arial", 14, "bold"), fg="#f0b84b", bg="#101010").grid(
+                         row=2, column=0, sticky="s", padx=20, pady=20)
+
+        tk.Button(frame, text="SETTINGS", command=self.show_settings,
+                  font=("Arial", 18, "bold"), bg="#2d7ef7", fg="white",
+                  activebackground="#4d96ff", activeforeground="white",
+                  relief="flat", bd=0, padx=18, pady=10).grid(
+                      row=2, column=0, sticky="sw", padx=20, pady=20)
+
         tk.Button(frame, text="ESCI", command=self.destroy, font=("Arial", 18, "bold"),
                   bg="#aa2e25", fg="white", activebackground="#c23c32",
                   activeforeground="white", relief="flat", bd=0,
@@ -198,8 +216,30 @@ class DROApp(tk.Tk):
             return
         self.clear_current_frame()
         self.current_frame = SpianaturaXYFrame(self.container, on_back=self.show_main_menu,
-                                               get_axis_values=self.get_axis_values, bg="#101010")
+                                               get_axis_values=self.get_axis_values,
+                                               pulses_per_mm=dict(self.pulses_per_mm),
+                                               using_provisional_settings=self.using_provisional_settings,
+                                               bg="#101010")
         self.current_frame.pack(fill="both", expand=True)
+
+    def show_settings(self):
+        self.clear_current_frame()
+        self.current_frame = SettingsFrame(
+            self.container,
+            on_back=self.show_main_menu,
+            on_save=self.save_pulses_per_mm,
+            initial_values=self.pulses_per_mm,
+            initial_notice=self.settings_notice,
+            bg="#101010",
+        )
+        self.current_frame.pack(fill="both", expand=True)
+
+    def save_pulses_per_mm(self, values):
+        saved_values = save_settings(values, self.settings_path)
+        self.pulses_per_mm = saved_values
+        self.settings_notice = f"Settings caricati da {self.settings_path}"
+        self.using_provisional_settings = False
+        return dict(saved_values)
 
     def show_placeholder(self, text):
         self.clear_current_frame()

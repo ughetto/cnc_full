@@ -1,32 +1,38 @@
 import tkinter as tk
 from keypad_numeric_overlay import ask_numeric_value
+from spianatura_toolpath import ToolpathValidationError, generate_spianatura_xy
 
 
 class SpianaturaXYFrame(tk.Frame):
     DEFAULT_VALUES = {
-        "totale spianatura [mm]": "010,000",
+        "profondità totale asportazione [mm]": "010,000",
         "diametro utensile [mm]": "010,000",
         "velocità di avanzamento [mm/s]": "005,000",
+        "velocità di affondo Z [mm/s]": "000,500",
         "profondità di passata [mm]": "000,150",
-        "sovrapposizione": "002,000",
+        "sovrapposizione [mm]": "002,000",
     }
 
-    def __init__(self, master, on_back, get_axis_values, *args, **kwargs):
+    def __init__(self, master, on_back, get_axis_values, pulses_per_mm=None,
+                 using_provisional_settings=False, *args, **kwargs):
         super().__init__(master, *args, **kwargs)
         self.configure(bg="#101010")
         self.on_back = on_back
         self.get_axis_values = get_axis_values
+        self.pulses_per_mm = dict(pulses_per_mm or {})
+        self.using_provisional_settings = using_provisional_settings
         self.value_labels = {}
         self.entry_vars = {}
         self.entry_widgets = {}
         self.refresh_ms = 100
 
         self.fields = [
-            "totale spianatura [mm]",
+            "profondità totale asportazione [mm]",
             "diametro utensile [mm]",
             "velocità di avanzamento [mm/s]",
+            "velocità di affondo Z [mm/s]",
             "profondità di passata [mm]",
-            "sovrapposizione",
+            "sovrapposizione [mm]",
         ]
 
         self.point_states = {
@@ -38,6 +44,9 @@ class SpianaturaXYFrame(tk.Frame):
             "fine": {"X": tk.StringVar(value="000.000"), "Y": tk.StringVar(value="000.000")},
         }
         self.point_buttons = {}
+        self.summary_var = tk.StringVar(
+            value="START genera soltanto il riepilogo offline: nessun movimento macchina."
+        )
 
         self.build_ui()
         self.apply_defaults()
@@ -141,11 +150,25 @@ class SpianaturaXYFrame(tk.Frame):
         self.build_point_block(right_panel, "inizio", 0)
         self.build_point_block(right_panel, "fine", 1)
 
+        summary_label = tk.Label(
+            right_panel,
+            textvariable=self.summary_var,
+            font=("Arial", 14, "bold"),
+            fg="#cfcfcf",
+            bg="#101010",
+            justify="left",
+            anchor="nw",
+            wraplength=430,
+        )
+        summary_label.grid(row=2, column=0, sticky="ew", pady=(0, 10))
+        self.summary_label = summary_label
+
         bottom_frame = tk.Frame(self, bg="#101010", padx=20, pady=16)
         bottom_frame.grid(row=2, column=0, sticky="ew")
         bottom_frame.grid_columnconfigure(0, weight=1)
         bottom_frame.grid_columnconfigure(1, weight=0)
         bottom_frame.grid_columnconfigure(2, weight=0)
+        bottom_frame.grid_columnconfigure(3, weight=0)
 
         hint_label = tk.Label(
             bottom_frame,
@@ -172,6 +195,22 @@ class SpianaturaXYFrame(tk.Frame):
         )
         default_button.grid(row=0, column=1, padx=10)
 
+        start_button = tk.Button(
+            bottom_frame,
+            text="START",
+            font=("Arial", 18, "bold"),
+            bg="#1f9d55",
+            fg="white",
+            activebackground="#27b964",
+            activeforeground="white",
+            relief="flat",
+            bd=0,
+            padx=18,
+            pady=10,
+            command=self.generate_preview,
+        )
+        start_button.grid(row=0, column=2, padx=10)
+
         back_button = tk.Button(
             bottom_frame,
             text="INDIETRO",
@@ -186,7 +225,7 @@ class SpianaturaXYFrame(tk.Frame):
             pady=10,
             command=self.on_back,
         )
-        back_button.grid(row=0, column=2, sticky="e")
+        back_button.grid(row=0, column=3, sticky="e")
 
     def build_point_block(self, parent, name: str, row: int):
         block = tk.Frame(
@@ -261,6 +300,63 @@ class SpianaturaXYFrame(tk.Frame):
 
     def comma_to_point(self, text: str) -> str:
         return (text or "000,000").replace(",", ".")
+
+    def parse_number(self, text: str) -> float:
+        return float((text or "").strip().replace(",", "."))
+
+    def generate_preview(self):
+        if not all(state["locked"] for state in self.point_states.values()):
+            self.show_summary_error("Bloccare sia INIZIO sia FINE prima di generare il percorso.")
+            return
+
+        try:
+            result = generate_spianatura_xy(
+                start_x=self.parse_number(self.point_vars["inizio"]["X"].get()),
+                start_y=self.parse_number(self.point_vars["inizio"]["Y"].get()),
+                end_x=self.parse_number(self.point_vars["fine"]["X"].get()),
+                end_y=self.parse_number(self.point_vars["fine"]["Y"].get()),
+                total_depth=self.parse_number(
+                    self.entry_vars["profondità totale asportazione [mm]"].get()
+                ),
+                depth_per_pass=self.parse_number(
+                    self.entry_vars["profondità di passata [mm]"].get()
+                ),
+                tool_diameter=self.parse_number(
+                    self.entry_vars["diametro utensile [mm]"].get()
+                ),
+                overlap=self.parse_number(self.entry_vars["sovrapposizione [mm]"].get()),
+                feed_xy=self.parse_number(
+                    self.entry_vars["velocità di avanzamento [mm/s]"].get()
+                ),
+                plunge_feed_z=self.parse_number(
+                    self.entry_vars["velocità di affondo Z [mm/s]"].get()
+                ),
+            )
+        except (ValueError, ToolpathValidationError) as exc:
+            self.show_summary_error(str(exc))
+            return
+
+        settings_text = ", ".join(
+            f"{axis}={self.pulses_per_mm.get(axis, 0):g}" for axis in ("X", "Y", "Z")
+        )
+        provisional_text = " (PROVVISORI)" if self.using_provisional_settings else ""
+        self.summary_var.set(
+            "PERCORSO OFFLINE GENERATO - NESSUN MOVIMENTO\n"
+            f"Livelli Z: {len(result.levels_z)} | Passate/livello: {result.passes_per_level}\n"
+            f"Passate totali: {result.total_passes} | Segmenti: {result.segment_count}\n"
+            f"Inizio: X={result.initial_point.x:.3f} Y={result.initial_point.y:.3f} "
+            f"Z={result.initial_point.z:.3f}\n"
+            f"Fine taglio: X={result.final_cut_point.x:.3f} "
+            f"Y={result.final_cut_point.y:.3f} Z={result.final_cut_point.z:.3f}\n"
+            f"Profondità finale: {result.levels_z[-1]:.3f} mm | Stepover: {result.stepover_mm:.3f} mm\n"
+            f"Risalita prevista 30 mm: Z={result.final_point.z:.3f}\n"
+            f"Impulsi/mm disponibili{provisional_text}: {settings_text} (non trasmessi)"
+        )
+        self.summary_label.configure(fg="#7CFF6B")
+
+    def show_summary_error(self, message):
+        self.summary_var.set(f"ERRORE DI VALIDAZIONE\n{message}\nNessun movimento macchina.")
+        self.summary_label.configure(fg="#ff6b6b")
 
     def sync_live_points(self, values: dict):
         live_x = self.comma_to_point(values.get("X", "000,000"))

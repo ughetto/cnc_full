@@ -1,4 +1,8 @@
 #include <SPI.h>
+#include <errno.h>
+#include <limits.h>
+#include <stdlib.h>
+#include <string.h>
 
 // =========================
 // LS7366R - Chip Select assi
@@ -82,7 +86,47 @@ AxisMotor motorX = {X_STEP_PIN, X_DIR_PIN, X_EN_PIN, 0.0f, false, 0, 0};
 AxisMotor motorY = {Y_STEP_PIN, Y_DIR_PIN, Y_EN_PIN, 0.0f, false, 0, 0};
 AxisMotor motorZ = {Z_STEP_PIN, Z_DIR_PIN, Z_EN_PIN, 0.0f, false, 0, 0};
 
-String uartLine;
+const size_t UART_LINE_CAPACITY = 192;
+char uartLineBuffer[UART_LINE_CAPACITY];
+size_t uartLineLength = 0;
+bool uartLineOverflow = false;
+String legacyUartLine;  // Conservato esclusivamente per JOG/SEMI esistenti.
+
+// =========================
+// Protocollo AUTO - sola ricezione/FIFO, nessun movimento reale
+// =========================
+const uint8_t AUTO_FIFO_CAPACITY = 32;
+const uint8_t AUTO_FIFO_LOW_WATERMARK = 8;
+const size_t AUTO_JOB_ID_CAPACITY = 17;
+
+enum AutoState {
+  AUTO_IDLE,
+  AUTO_BUFFERING,
+  AUTO_RUNNING,
+  AUTO_STOPPED,
+  AUTO_ERROR
+};
+
+struct MotionSegment {
+  uint32_t id;
+  int32_t targetX;
+  int32_t targetY;
+  int32_t targetZ;
+  float feedMmS;
+  uint32_t durationUs;
+  bool endProgram;
+};
+
+MotionSegment autoFifo[AUTO_FIFO_CAPACITY];
+uint8_t autoFifoHead = 0;
+uint8_t autoFifoTail = 0;
+uint8_t autoFifoCount = 0;
+AutoState autoState = AUTO_IDLE;
+char autoJobId[AUTO_JOB_ID_CAPACITY] = "";
+uint32_t autoExpectedSegmentId = 1;
+uint32_t autoLastAcceptedSegmentId = 0;
+uint32_t autoTotalSegments = 0;
+bool autoBufferLowReported = false;
 
 float jogX_sps = 0.0f;
 float jogY_sps = 0.0f;
@@ -272,6 +316,483 @@ void updateMotor(AxisMotor &m) {
 }
 
 // =========================
+// Protocollo AUTO: CRC, risposte e FIFO
+// =========================
+uint16_t autoCrc16Ccitt(const char *text) {
+  uint16_t crc = 0xFFFF;
+  while (*text != '\0') {
+    crc ^= ((uint16_t)(uint8_t)*text++) << 8;
+    for (uint8_t bit = 0; bit < 8; bit++) {
+      crc = (crc & 0x8000) ? (uint16_t)((crc << 1) ^ 0x1021) : (uint16_t)(crc << 1);
+    }
+  }
+  return crc;
+}
+
+bool parseHex16Strict(const char *text, uint16_t &value) {
+  if (text == nullptr || strlen(text) != 4) return false;
+  uint16_t parsed = 0;
+  for (uint8_t i = 0; i < 4; i++) {
+    char c = text[i];
+    uint8_t nibble;
+    if (c >= '0' && c <= '9') nibble = (uint8_t)(c - '0');
+    else if (c >= 'A' && c <= 'F') nibble = (uint8_t)(c - 'A' + 10);
+    else if (c >= 'a' && c <= 'f') nibble = (uint8_t)(c - 'a' + 10);
+    else return false;
+    parsed = (uint16_t)((parsed << 4) | nibble);
+  }
+  value = parsed;
+  return true;
+}
+
+void sendAutoPayload(const char *payload) {
+  uint16_t crc = autoCrc16Ccitt(payload);
+  Serial1.print(payload);
+  Serial1.print('*');
+  if (crc < 0x1000) Serial1.print('0');
+  if (crc < 0x0100) Serial1.print('0');
+  if (crc < 0x0010) Serial1.print('0');
+  Serial1.println(crc, HEX);
+}
+
+const char *safeAutoJob(const char *job) {
+  return (job != nullptr && job[0] != '\0') ? job : "NONE";
+}
+
+const char *autoStateName() {
+  switch (autoState) {
+    case AUTO_IDLE: return "IDLE";
+    case AUTO_BUFFERING: return "BUFFERING";
+    case AUTO_RUNNING: return "RUNNING";
+    case AUTO_STOPPED: return "STOPPED";
+    case AUTO_ERROR: return "ERROR";
+  }
+  return "ERROR";
+}
+
+uint8_t autoFifoFree() {
+  return (uint8_t)(AUTO_FIFO_CAPACITY - autoFifoCount);
+}
+
+void clearAutoFifo() {
+  autoFifoHead = 0;
+  autoFifoTail = 0;
+  autoFifoCount = 0;
+  autoBufferLowReported = false;
+}
+
+bool enqueueAutoSegment(const MotionSegment &segment) {
+  if (autoFifoCount >= AUTO_FIFO_CAPACITY) return false;
+  autoFifo[autoFifoTail] = segment;
+  autoFifoTail = (uint8_t)((autoFifoTail + 1) % AUTO_FIFO_CAPACITY);
+  autoFifoCount++;
+  if (autoFifoCount > AUTO_FIFO_LOW_WATERMARK) autoBufferLowReported = false;
+  return true;
+}
+
+bool autoModeActive() {
+  // STOPPED ed ERROR mantengono il blocco manuale fino a RESET esplicito.
+  return autoState != AUTO_IDLE;
+}
+
+void clearManualMotionRequests() {
+  jogX_sps = 0.0f;
+  jogY_sps = 0.0f;
+  jogZ_sps = 0.0f;
+  semiX_sps = 0.0f;
+  semiY_sps = 0.0f;
+  semiZ_sps = 0.0f;
+}
+
+void sendAutoError(const char *job, const char *code, uint32_t segmentId = 0) {
+  char payload[150];
+  if (segmentId > 0) {
+    snprintf(payload, sizeof(payload), "AUTO,ERROR,JOB:%s,CODE:%s,ID:%lu",
+             safeAutoJob(job), code, (unsigned long)segmentId);
+  } else {
+    snprintf(payload, sizeof(payload), "AUTO,ERROR,JOB:%s,CODE:%s",
+             safeAutoJob(job), code);
+  }
+  sendAutoPayload(payload);
+}
+
+void enterAutoError(const char *code, uint32_t segmentId = 0) {
+  clearAutoFifo();
+  clearManualMotionRequests();
+  autoState = AUTO_ERROR;
+  sendAutoError(autoJobId, code, segmentId);
+}
+
+void sendAutoAck(const char *command, uint32_t segmentId = 0) {
+  char payload[150];
+  if (segmentId > 0) {
+    snprintf(payload, sizeof(payload), "AUTO,ACK,JOB:%s,CMD:%s,ID:%lu,FREE:%u",
+             safeAutoJob(autoJobId), command, (unsigned long)segmentId, autoFifoFree());
+  } else {
+    snprintf(payload, sizeof(payload), "AUTO,ACK,JOB:%s,CMD:%s,FREE:%u",
+             safeAutoJob(autoJobId), command, autoFifoFree());
+  }
+  sendAutoPayload(payload);
+}
+
+void sendAutoStatus() {
+  char payload[170];
+  snprintf(payload, sizeof(payload),
+           "AUTO,STATUS,JOB:%s,STATE:%s,Q:%u,FREE:%u,LAST:%lu,EXEC:0,"
+           "AUTO_ACTIVE:%u,MANUAL_BLOCKED:%u",
+           safeAutoJob(autoJobId), autoStateName(), autoFifoCount, autoFifoFree(),
+           (unsigned long)autoLastAcceptedSegmentId,
+           autoModeActive() ? 1 : 0, autoModeActive() ? 1 : 0);
+  sendAutoPayload(payload);
+}
+
+void sendAutoBufferLowIfNeeded() {
+  if (autoState != AUTO_RUNNING || autoFifoCount > AUTO_FIFO_LOW_WATERMARK ||
+      autoBufferLowReported) return;
+
+  char payload[150];
+  snprintf(payload, sizeof(payload),
+           "AUTO,BUFFER_LOW,JOB:%s,Q:%u,FREE:%u,LAST:%lu",
+           safeAutoJob(autoJobId), autoFifoCount, autoFifoFree(),
+           (unsigned long)autoLastAcceptedSegmentId);
+  sendAutoPayload(payload);
+  autoBufferLowReported = true;
+}
+
+bool parseUint32Strict(const char *text, uint32_t &value) {
+  if (text == nullptr || text[0] == '\0' || text[0] == '-') return false;
+  errno = 0;
+  char *end = nullptr;
+  unsigned long parsed = strtoul(text, &end, 10);
+  if (errno != 0 || end == text || *end != '\0') return false;
+  value = (uint32_t)parsed;
+  return true;
+}
+
+bool parseInt32Strict(const char *text, int32_t &value) {
+  if (text == nullptr || text[0] == '\0') return false;
+  errno = 0;
+  char *end = nullptr;
+  long parsed = strtol(text, &end, 10);
+  if (errno != 0 || end == text || *end != '\0' || parsed < INT32_MIN || parsed > INT32_MAX) {
+    return false;
+  }
+  value = (int32_t)parsed;
+  return true;
+}
+
+bool parsePositiveFloatStrict(const char *text, float &value) {
+  if (text == nullptr || text[0] == '\0') return false;
+  errno = 0;
+  char *end = nullptr;
+  float parsed = strtof(text, &end);
+  if (errno != 0 || end == text || *end != '\0' || !isfinite(parsed) || parsed <= 0.0f) {
+    return false;
+  }
+  value = parsed;
+  return true;
+}
+
+bool copyAutoToken(char *destination, size_t capacity, const char *source) {
+  size_t length = strlen(source);
+  if (length == 0 || length >= capacity) return false;
+  for (size_t i = 0; i < length; i++) {
+    char c = source[i];
+    if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+          (c >= '0' && c <= '9') || c == '_' || c == '-')) return false;
+  }
+  memcpy(destination, source, length + 1);
+  return true;
+}
+
+struct AutoParsedFields {
+  char job[AUTO_JOB_ID_CAPACITY];
+  char reason[25];
+  uint32_t totalSegments;
+  uint32_t id;
+  int32_t x;
+  int32_t y;
+  int32_t z;
+  float feed;
+  uint32_t durationUs;
+  bool endProgram;
+  bool hasJob;
+  bool hasReason;
+  bool hasTotalSegments;
+  bool hasId;
+  bool hasX;
+  bool hasY;
+  bool hasZ;
+  bool hasFeed;
+  bool hasDuration;
+  bool hasEnd;
+};
+
+void initAutoParsedFields(AutoParsedFields &fields) {
+  memset(&fields, 0, sizeof(fields));
+}
+
+bool parseAutoField(char *token, AutoParsedFields &fields) {
+  char *separator = strchr(token, ':');
+  if (separator == nullptr || separator == token || separator[1] == '\0') return false;
+  *separator = '\0';
+  const char *key = token;
+  const char *value = separator + 1;
+
+  if (strcmp(key, "JOB") == 0) {
+    if (fields.hasJob || !copyAutoToken(fields.job, sizeof(fields.job), value)) return false;
+    fields.hasJob = true;
+    return true;
+  }
+  if (strcmp(key, "REASON") == 0) {
+    if (fields.hasReason || !copyAutoToken(fields.reason, sizeof(fields.reason), value)) return false;
+    fields.hasReason = true;
+    return true;
+  }
+  if (strcmp(key, "N") == 0) {
+    if (fields.hasTotalSegments || !parseUint32Strict(value, fields.totalSegments)) return false;
+    fields.hasTotalSegments = true;
+    return true;
+  }
+  if (strcmp(key, "ID") == 0) {
+    if (fields.hasId || !parseUint32Strict(value, fields.id)) return false;
+    fields.hasId = true;
+    return true;
+  }
+  if (strcmp(key, "X") == 0) {
+    if (fields.hasX || !parseInt32Strict(value, fields.x)) return false;
+    fields.hasX = true;
+    return true;
+  }
+  if (strcmp(key, "Y") == 0) {
+    if (fields.hasY || !parseInt32Strict(value, fields.y)) return false;
+    fields.hasY = true;
+    return true;
+  }
+  if (strcmp(key, "Z") == 0) {
+    if (fields.hasZ || !parseInt32Strict(value, fields.z)) return false;
+    fields.hasZ = true;
+    return true;
+  }
+  if (strcmp(key, "F") == 0) {
+    if (fields.hasFeed || !parsePositiveFloatStrict(value, fields.feed)) return false;
+    fields.hasFeed = true;
+    return true;
+  }
+  if (strcmp(key, "T") == 0) {
+    if (fields.hasDuration || !parseUint32Strict(value, fields.durationUs) ||
+        fields.durationUs == 0) return false;
+    fields.hasDuration = true;
+    return true;
+  }
+  if (strcmp(key, "END") == 0) {
+    if (fields.hasEnd || (strcmp(value, "0") != 0 && strcmp(value, "1") != 0)) return false;
+    fields.endProgram = strcmp(value, "1") == 0;
+    fields.hasEnd = true;
+    return true;
+  }
+  return false;
+}
+
+bool autoJobMatches(const char *job) {
+  return job != nullptr && autoJobId[0] != '\0' && strcmp(job, autoJobId) == 0;
+}
+
+void processAutoCommand(const char *command, const AutoParsedFields &fields) {
+  if (strcmp(command, "BEGIN") == 0) {
+    if (!fields.hasJob || !fields.hasTotalSegments || fields.totalSegments == 0) {
+      sendAutoError(fields.hasJob ? fields.job : "NONE", "BAD_BEGIN");
+      return;
+    }
+    if ((autoState == AUTO_BUFFERING || autoState == AUTO_RUNNING) &&
+        !autoJobMatches(fields.job)) {
+      sendAutoError(fields.job, "BUSY");
+      return;
+    }
+    if (autoJobMatches(fields.job) &&
+        (autoState == AUTO_BUFFERING || autoState == AUTO_RUNNING)) {
+      if (fields.totalSegments != autoTotalSegments) {
+        sendAutoError(fields.job, "BAD_BEGIN");
+        return;
+      }
+      clearManualMotionRequests();
+      sendAutoAck("BEGIN");
+      return;
+    }
+
+    clearAutoFifo();
+    clearManualMotionRequests();
+    strncpy(autoJobId, fields.job, sizeof(autoJobId) - 1);
+    autoJobId[sizeof(autoJobId) - 1] = '\0';
+    autoTotalSegments = fields.totalSegments;
+    autoExpectedSegmentId = 1;
+    autoLastAcceptedSegmentId = 0;
+    autoState = AUTO_BUFFERING;
+    sendAutoAck("BEGIN");
+    return;
+  }
+
+  if (strcmp(command, "RESET") == 0) {
+    if (!fields.hasJob) {
+      sendAutoError("NONE", "BAD_RESET");
+      return;
+    }
+    if (autoJobId[0] != '\0' && !autoJobMatches(fields.job)) {
+      sendAutoError(fields.job, "JOB_MISMATCH");
+      return;
+    }
+    if (autoState != AUTO_STOPPED && autoState != AUTO_ERROR && autoState != AUTO_IDLE) {
+      sendAutoError(safeAutoJob(autoJobId), "BAD_STATE");
+      return;
+    }
+    if (autoJobId[0] == '\0') {
+      strncpy(autoJobId, fields.job, sizeof(autoJobId) - 1);
+      autoJobId[sizeof(autoJobId) - 1] = '\0';
+    }
+    clearAutoFifo();
+    clearManualMotionRequests();
+    autoState = AUTO_IDLE;
+    autoExpectedSegmentId = 1;
+    autoLastAcceptedSegmentId = 0;
+    autoTotalSegments = 0;
+    sendAutoAck("RESET");
+    autoJobId[0] = '\0';
+    return;
+  }
+
+  if (strcmp(command, "STATUS") == 0) {
+    if (autoJobId[0] != '\0' && (!fields.hasJob || !autoJobMatches(fields.job))) {
+      sendAutoError(fields.hasJob ? fields.job : "NONE", "JOB_MISMATCH");
+      return;
+    }
+    sendAutoStatus();
+    return;
+  }
+
+  if (!fields.hasJob || !autoJobMatches(fields.job)) {
+    sendAutoError(fields.hasJob ? fields.job : "NONE", "JOB_MISMATCH");
+    return;
+  }
+
+  if (strcmp(command, "MOVE") == 0) {
+    if (autoState != AUTO_BUFFERING && autoState != AUTO_RUNNING) {
+      sendAutoError(autoJobId, "BAD_STATE", fields.hasId ? fields.id : 0);
+      return;
+    }
+    if (!(fields.hasId && fields.hasX && fields.hasY && fields.hasZ && fields.hasFeed &&
+          fields.hasDuration && fields.hasEnd)) {
+      enterAutoError("BAD_MOVE", fields.hasId ? fields.id : 0);
+      return;
+    }
+    if (fields.id == 0) {
+      enterAutoError("BAD_ID");
+      return;
+    }
+    if (fields.id < autoExpectedSegmentId) {
+      sendAutoAck("MOVE", fields.id);
+      return;
+    }
+    if (fields.id != autoExpectedSegmentId || fields.id > autoTotalSegments) {
+      enterAutoError("BAD_ID", fields.id);
+      return;
+    }
+    bool shouldBeEnd = fields.id == autoTotalSegments;
+    if (fields.endProgram != shouldBeEnd) {
+      enterAutoError("BAD_END", fields.id);
+      return;
+    }
+
+    MotionSegment segment = {
+      fields.id, fields.x, fields.y, fields.z, fields.feed, fields.durationUs, fields.endProgram
+    };
+    if (!enqueueAutoSegment(segment)) {
+      enterAutoError("FIFO_FULL", fields.id);
+      return;
+    }
+    autoLastAcceptedSegmentId = fields.id;
+    autoExpectedSegmentId = fields.id + 1;
+    sendAutoAck("MOVE", fields.id);
+    return;
+  }
+
+  if (strcmp(command, "RUN") == 0) {
+    if (autoState == AUTO_RUNNING) {
+      clearManualMotionRequests();
+      sendAutoAck("RUN");
+      return;
+    }
+    if (autoState != AUTO_BUFFERING || autoFifoCount == 0) {
+      sendAutoError(autoJobId, "BAD_STATE");
+      return;
+    }
+    clearManualMotionRequests();
+    autoState = AUTO_RUNNING;
+    sendAutoAck("RUN");
+    sendAutoBufferLowIfNeeded();
+    return;
+  }
+
+  if (strcmp(command, "STOP") == 0) {
+    uint32_t lastAccepted = autoLastAcceptedSegmentId;
+    clearAutoFifo();
+    clearManualMotionRequests();
+    autoState = AUTO_STOPPED;
+    sendAutoAck("STOP");
+    char payload[150];
+    snprintf(payload, sizeof(payload), "AUTO,STOPPED,JOB:%s,LAST:%lu,REASON:%s",
+             safeAutoJob(autoJobId), (unsigned long)lastAccepted,
+             fields.hasReason ? fields.reason : "USER");
+    sendAutoPayload(payload);
+    return;
+  }
+
+  if (strcmp(command, "PING") == 0) {
+    sendAutoAck("PING");
+    return;
+  }
+
+  sendAutoError(autoJobId, "UNKNOWN_CMD");
+}
+
+void processAutoLine(char *line) {
+  char *checksumSeparator = strrchr(line, '*');
+  if (checksumSeparator == nullptr || strchr(checksumSeparator + 1, '*') != nullptr) {
+    enterAutoError("BAD_CRC");
+    return;
+  }
+
+  uint16_t receivedCrc;
+  if (!parseHex16Strict(checksumSeparator + 1, receivedCrc)) {
+    enterAutoError("BAD_CRC");
+    return;
+  }
+  *checksumSeparator = '\0';
+  if (autoCrc16Ccitt(line) != receivedCrc) {
+    enterAutoError("BAD_CRC");
+    return;
+  }
+
+  char *savePointer = nullptr;
+  char *prefix = strtok_r(line, ",", &savePointer);
+  char *command = strtok_r(nullptr, ",", &savePointer);
+  if (prefix == nullptr || command == nullptr || strcmp(prefix, "AUTO") != 0) {
+    enterAutoError("BAD_FORMAT");
+    return;
+  }
+
+  AutoParsedFields fields;
+  initAutoParsedFields(fields);
+  char *token;
+  while ((token = strtok_r(nullptr, ",", &savePointer)) != nullptr) {
+    if (!parseAutoField(token, fields)) {
+      enterAutoError("BAD_FIELD");
+      return;
+    }
+  }
+  processAutoCommand(command, fields);
+}
+
+// =========================
 // Parsing comando UART
 // atteso: JOG,X:120.0,Y:-50.0,Z:0.0
 // =========================
@@ -288,6 +809,11 @@ float extractAxisValue(const String &line, const char axisName) {
 }
 
 void processCommand(const String &line) {
+  if (autoModeActive() && (line.startsWith("JOG") || line.startsWith("SEMI"))) {
+    // AUTO mantiene la proprietà esclusiva del movimento fino a RESET.
+    return;
+  }
+
   if (line.startsWith("JOG")) {
     jogX_sps = extractAxisValue(line, 'X');
     jogY_sps = extractAxisValue(line, 'Y');
@@ -337,14 +863,30 @@ void readUartCommands() {
     if (c == '\r') continue;
 
     if (c == '\n') {
-      if (uartLine.length() > 0) {
-        processCommand(uartLine);
-        uartLine = "";
+      if (uartLineOverflow) {
+        uartLineBuffer[uartLineLength] = '\0';
+        if (strncmp(uartLineBuffer, "AUTO,", 5) == 0) {
+          enterAutoError("LINE_TOO_LONG");
+        }
+      } else if (uartLineLength > 0) {
+        uartLineBuffer[uartLineLength] = '\0';
+        if (strncmp(uartLineBuffer, "AUTO,", 5) == 0) {
+          processAutoLine(uartLineBuffer);
+        } else {
+          // Compatibilità: JOG e SEMI continuano a usare l'interprete esistente.
+          legacyUartLine = uartLineBuffer;
+          processCommand(legacyUartLine);
+        }
       }
+      uartLineLength = 0;
+      uartLineOverflow = false;
     } else {
-      uartLine += c;
-      if (uartLine.length() > 120) {
-        uartLine = "";
+      if (!uartLineOverflow) {
+        if (uartLineLength < UART_LINE_CAPACITY - 1) {
+          uartLineBuffer[uartLineLength++] = c;
+        } else {
+          uartLineOverflow = true;
+        }
       }
     }
   }
@@ -368,6 +910,14 @@ float chooseSemiAxisSpeed(float jogSpeed, uint8_t plusPin, uint8_t minusPin, flo
 }
 
 void applyRequestedSpeeds() {
+  if (autoModeActive()) {
+    // Nessun segmento AUTO viene ancora eseguito: durante AUTO ogni asse resta fermo.
+    setMotorSpeed(motorX, 0.0f, MAX_SPEED_XY_SPS);
+    setMotorSpeed(motorY, 0.0f, MAX_SPEED_XY_SPS);
+    setMotorSpeed(motorZ, 0.0f, MAX_SPEED_Z_SPS);
+    return;
+  }
+
   float sx = chooseSemiAxisSpeed(jogX_sps, SEMI_X_PLUS_PIN, SEMI_X_MINUS_PIN, semiX_sps);
   float sy = chooseSemiAxisSpeed(jogY_sps, SEMI_Y_PLUS_PIN, SEMI_Y_MINUS_PIN, semiY_sps);
   float sz = jogZ_sps;
