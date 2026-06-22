@@ -43,7 +43,7 @@ class ManualeFrame(tk.Frame):
         return "TkFixedFont"
 
     def build_ui(self):
-        self.grid_rowconfigure(0, minsize=76, weight=0)
+        self.grid_rowconfigure(0, minsize=96, weight=0)
         self.grid_rowconfigure(1, weight=1)
         self.grid_rowconfigure(2, minsize=58, weight=0)
         self.grid_columnconfigure(0, weight=1)
@@ -57,12 +57,12 @@ class ManualeFrame(tk.Frame):
             box = tk.Frame(header, bg="#1a1a1a", highlightbackground="#333333",
                            highlightthickness=2, padx=12, pady=4)
             box.grid(row=0, column=idx, sticky="ew", padx=6)
-            tk.Label(box, text=axis, font=("Arial", 14, "bold"),
+            tk.Label(box, text=axis, font=("Arial", 16, "bold"),
                      fg="#cfcfcf", bg="#1a1a1a").pack()
             # La larghezza comprende anche l'eventuale segno meno. L'ancoraggio
             # a destra mantiene ferme unita, decimali e pannelli degli altri assi.
             lbl = tk.Label(box, text="000,000",
-                           font=(self.dro_font_family, 25, "bold"),
+                           font=(self.dro_font_family, 36, "bold"),
                            width=9, anchor="e", padx=4,
                            fg="#7CFF6B", bg="#1a1a1a")
             lbl.pack(fill="x")
@@ -121,7 +121,7 @@ class ManualeFrame(tk.Frame):
                             command=self.speed_changed, showvalue=False,
                             bg="#151515", fg="white", troughcolor="#404040",
                             activebackground="#2d7ef7", highlightthickness=0,
-                            font=("Arial", 12))
+                            width=32, sliderlength=48, font=("Arial", 12))
         x_slider.grid(row=3, column=0, pady=(0, 34))
 
         tk.Label(speed_panel, text="ASSE Y", font=("Arial", 17, "bold"),
@@ -134,7 +134,7 @@ class ManualeFrame(tk.Frame):
                             command=self.speed_changed, showvalue=False,
                             bg="#151515", fg="white", troughcolor="#404040",
                             activebackground="#2d7ef7", highlightthickness=0,
-                            font=("Arial", 12))
+                            width=32, sliderlength=48, font=("Arial", 12))
         y_slider.grid(row=6, column=0, pady=(0, 20))
 
         tk.Label(speed_panel, text="I commutatori hardware X+/X- e Y+/Y- usano queste velocita.",
