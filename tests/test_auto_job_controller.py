@@ -51,6 +51,11 @@ class FakeTeensy:
             return encode_auto_message("ACK", JOB=job_id, CMD="RUN")
         if message.command == "STOP":
             return encode_auto_message("STOPPED", JOB=job_id, REASON="TEST")
+        if message.command == "RESET":
+            self.job_id = None
+            return encode_auto_message("ACK", JOB=job_id, CMD="RESET")
+        if message.command == "STATUS":
+            return encode_auto_message("STATUS", JOB=job_id, STATE="IDLE", EXEC=0)
         raise AssertionError(f"Comando fake non gestito: {message.command}")
 
 
@@ -59,6 +64,14 @@ def make_segments(count):
         AutoSegment(index * 10, index * 20, index, 5.0, 100_000)
         for index in range(1, count + 1)
     ]
+
+
+def start_test_job(controller, count):
+    return controller.start_job(
+        make_segments(count),
+        current_position_steps=(0, 0, 0),
+        pulses_per_mm=(80.0, 80.0, 400.0),
+    )
 
 
 class AutoJobControllerTests(unittest.TestCase):
@@ -80,7 +93,13 @@ class AutoJobControllerTests(unittest.TestCase):
     def test_fake_teensy_happy_path_and_duplicate_ack(self):
         controller = self.make_controller(prefill=2)
         fake = FakeTeensy()
-        controller.start_job(make_segments(2))
+        start_test_job(controller, 2)
+
+        begin = decode_auto_message(self.transport.sent[0])
+        self.assertEqual(
+            {key: begin.fields[key] for key in ("CX", "CY", "CZ", "PX", "PY", "PZ")},
+            {"CX": "0", "CY": "0", "CZ": "0", "PX": "80", "PY": "80", "PZ": "400"},
+        )
 
         controller.handle_line(fake.receive(self.transport.sent[0]))
         move_lines = self.transport.sent[1:3]
@@ -95,7 +114,7 @@ class AutoJobControllerTests(unittest.TestCase):
 
     def test_out_of_order_ack_stops_with_protocol_error(self):
         controller = self.make_controller(prefill=3)
-        controller.start_job(make_segments(3))
+        start_test_job(controller, 3)
         self.ack(controller, "BEGIN")
 
         self.ack(controller, "MOVE", ID=2)
@@ -119,7 +138,7 @@ class AutoJobControllerTests(unittest.TestCase):
 
     def test_timeout_retries_exact_line_then_sends_stop(self):
         controller = self.make_controller(retries=2)
-        controller.start_job(make_segments(1))
+        start_test_job(controller, 1)
         begin_line = self.transport.sent[0]
 
         for _ in range(2):
@@ -135,7 +154,7 @@ class AutoJobControllerTests(unittest.TestCase):
 
     def test_buffer_low_refills_in_order(self):
         controller = self.make_controller(prefill=2)
-        controller.start_job(make_segments(5))
+        start_test_job(controller, 5)
         self.ack(controller, "BEGIN")
         self.ack(controller, "MOVE", ID=1)
         self.ack(controller, "MOVE", ID=2)
@@ -152,7 +171,7 @@ class AutoJobControllerTests(unittest.TestCase):
 
     def test_stop_is_clean_and_idempotent(self):
         controller = self.make_controller()
-        controller.start_job(make_segments(2))
+        start_test_job(controller, 2)
 
         self.assertTrue(controller.stop())
         self.assertTrue(controller.stop())
@@ -162,7 +181,7 @@ class AutoJobControllerTests(unittest.TestCase):
 
     def test_non_auto_line_is_ignored(self):
         controller = self.make_controller()
-        controller.start_job(make_segments(1))
+        start_test_job(controller, 1)
 
         self.assertFalse(controller.handle_line("X:1,Y:2,Z:3"))
         self.assertEqual(controller.state, AutoJobState.BEGIN_SENT)
@@ -186,6 +205,46 @@ class AutoJobControllerTests(unittest.TestCase):
                 values.update(override)
                 with self.assertRaises(ValueError):
                     AutoSegment(**values)
+
+    def test_job_origin_and_axis_scales_are_required(self):
+        controller = self.make_controller()
+        segments = make_segments(1)
+
+        with self.assertRaises(ValueError):
+            controller.start_job(
+                segments,
+                current_position_steps=(0.5, 0, 0),
+                pulses_per_mm=(80.0, 80.0, 400.0),
+            )
+        with self.assertRaises(ValueError):
+            controller.start_job(
+                segments,
+                current_position_steps=(0, 0, 0),
+                pulses_per_mm=(80.0, 0.0, 400.0),
+            )
+
+    def test_status_is_recorded_without_changing_state(self):
+        controller = self.make_controller()
+        start_test_job(controller, 1)
+
+        controller.handle_line(
+            encode_auto_message("STATUS", JOB="TEST1", STATE="BUFFERING", EXEC=0)
+        )
+
+        self.assertEqual(controller.state, AutoJobState.BEGIN_SENT)
+        self.assertEqual(controller.last_status["STATE"], "BUFFERING")
+
+    def test_reset_round_trip_returns_to_idle(self):
+        controller = self.make_controller()
+        start_test_job(controller, 1)
+        controller.state = AutoJobState.STOPPED
+
+        controller.request_reset()
+        self.assertEqual(controller.state, AutoJobState.RESET_SENT)
+        controller.handle_line(encode_auto_message("ACK", JOB="TEST1", CMD="RESET"))
+
+        self.assertEqual(controller.state, AutoJobState.IDLE)
+        self.assertIsNone(controller.job_id)
 
 
 if __name__ == "__main__":

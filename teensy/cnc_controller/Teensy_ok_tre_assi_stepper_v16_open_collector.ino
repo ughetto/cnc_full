@@ -1,4 +1,5 @@
 #include <SPI.h>
+#include <IntervalTimer.h>
 #include <errno.h>
 #include <limits.h>
 #include <stdlib.h>
@@ -52,6 +53,9 @@ const float MAX_SPEED_Z_SPS  = 6400.0f;
 
 // Durata impulso STEP in microsecondi
 const uint32_t STEP_PULSE_US = 10;
+const uint32_t AUTO_DIR_SETUP_US = 20;
+const uint32_t AUTO_MIN_STEP_HIGH_US = 10;
+const uint32_t AUTO_MAX_TIMER_INTERVAL_US = 10000000;
 
 // =========================
 // Comandi LS7366R
@@ -93,7 +97,7 @@ bool uartLineOverflow = false;
 String legacyUartLine;  // Conservato esclusivamente per JOG/SEMI esistenti.
 
 // =========================
-// Protocollo AUTO - sola ricezione/FIFO, nessun movimento reale
+// Protocollo AUTO - emissione STEP sperimentale per collaudo elettrico
 // =========================
 const uint8_t AUTO_FIFO_CAPACITY = 32;
 const uint8_t AUTO_FIFO_LOW_WATERMARK = 8;
@@ -103,6 +107,7 @@ enum AutoState {
   AUTO_IDLE,
   AUTO_BUFFERING,
   AUTO_RUNNING,
+  AUTO_COMPLETED,
   AUTO_STOPPED,
   AUTO_ERROR
 };
@@ -117,6 +122,64 @@ struct MotionSegment {
   bool endProgram;
 };
 
+struct AutoInterpolationPlan {
+  int32_t targetX;
+  int32_t targetY;
+  int32_t targetZ;
+  int64_t deltaX;
+  int64_t deltaY;
+  int64_t deltaZ;
+  uint32_t absDeltaX;
+  uint32_t absDeltaY;
+  uint32_t absDeltaZ;
+  uint32_t dominantSteps;
+  uint32_t ddaAccumulatorX;
+  uint32_t ddaAccumulatorY;
+  uint32_t ddaAccumulatorZ;
+  uint32_t dominantStepIndex;
+  float feedMmS;
+  float pathLengthMm;
+  float dominantStepIntervalUs;
+  uint32_t calculatedDurationUs;
+  char dominantAxis;
+  bool valid;
+};
+
+struct AutoParsedFields {
+  char job[AUTO_JOB_ID_CAPACITY];
+  char reason[25];
+  uint32_t totalSegments;
+  uint32_t id;
+  int32_t x;
+  int32_t y;
+  int32_t z;
+  int32_t currentX;
+  int32_t currentY;
+  int32_t currentZ;
+  float feed;
+  float pulsesPerMmX;
+  float pulsesPerMmY;
+  float pulsesPerMmZ;
+  uint32_t durationUs;
+  bool endProgram;
+  bool hasJob;
+  bool hasReason;
+  bool hasTotalSegments;
+  bool hasId;
+  bool hasX;
+  bool hasY;
+  bool hasZ;
+  bool hasCurrentX;
+  bool hasCurrentY;
+  bool hasCurrentZ;
+  bool hasFeed;
+  bool hasPulsesPerMmX;
+  bool hasPulsesPerMmY;
+  bool hasPulsesPerMmZ;
+  bool hasDuration;
+  bool hasEnd;
+};
+
 MotionSegment autoFifo[AUTO_FIFO_CAPACITY];
 uint8_t autoFifoHead = 0;
 uint8_t autoFifoTail = 0;
@@ -127,6 +190,40 @@ uint32_t autoExpectedSegmentId = 1;
 uint32_t autoLastAcceptedSegmentId = 0;
 uint32_t autoTotalSegments = 0;
 bool autoBufferLowReported = false;
+MotionSegment autoActiveSegment;
+bool autoSegmentActive = false;
+uint32_t autoLastCompletedSegmentId = 0;
+bool autoCompletedReported = false;
+AutoInterpolationPlan autoInterpolationPlan;
+int32_t autoCommandedX = 0;
+int32_t autoCommandedY = 0;
+int32_t autoCommandedZ = 0;
+int32_t autoJobStartX = 0;
+int32_t autoJobStartY = 0;
+int32_t autoJobStartZ = 0;
+float autoPulsesPerMmX = 0.0f;
+float autoPulsesPerMmY = 0.0f;
+float autoPulsesPerMmZ = 0.0f;
+
+IntervalTimer autoStepTimer;
+volatile bool autoStepTimerRunning = false;
+volatile bool autoStepPulsePhase = false;
+volatile bool autoStepSegmentComplete = false;
+volatile uint8_t autoStepPulseMask = 0;
+volatile uint32_t autoIsrAbsDeltaX = 0;
+volatile uint32_t autoIsrAbsDeltaY = 0;
+volatile uint32_t autoIsrAbsDeltaZ = 0;
+volatile uint32_t autoIsrDominantSteps = 0;
+volatile uint32_t autoIsrAccumulatorX = 0;
+volatile uint32_t autoIsrAccumulatorY = 0;
+volatile uint32_t autoIsrAccumulatorZ = 0;
+volatile uint32_t autoIsrDominantStepIndex = 0;
+volatile uint32_t autoIsrEmittedX = 0;
+volatile uint32_t autoIsrEmittedY = 0;
+volatile uint32_t autoIsrEmittedZ = 0;
+volatile uint32_t autoIsrStepIntervalUs = 0;
+volatile uint32_t autoIsrEarliestStepUs = 0;
+volatile uint32_t autoIsrLastStepStartUs = 0;
 
 float jogX_sps = 0.0f;
 float jogY_sps = 0.0f;
@@ -364,6 +461,7 @@ const char *autoStateName() {
     case AUTO_IDLE: return "IDLE";
     case AUTO_BUFFERING: return "BUFFERING";
     case AUTO_RUNNING: return "RUNNING";
+    case AUTO_COMPLETED: return "COMPLETED";
     case AUTO_STOPPED: return "STOPPED";
     case AUTO_ERROR: return "ERROR";
   }
@@ -374,11 +472,117 @@ uint8_t autoFifoFree() {
   return (uint8_t)(AUTO_FIFO_CAPACITY - autoFifoCount);
 }
 
+void releaseAutoStepMask(uint8_t mask) {
+  if (mask & 0x01) ocWrite(motorX.stepPin, HIGH);
+  if (mask & 0x02) ocWrite(motorY.stepPin, HIGH);
+  if (mask & 0x04) ocWrite(motorZ.stepPin, HIGH);
+}
+
+void stopAutoStepGeneration() {
+  noInterrupts();
+  autoStepTimerRunning = false;
+  autoStepTimer.end();
+  uint8_t pulseMask = autoStepPulseMask;
+  autoStepPulseMask = 0;
+  autoStepPulsePhase = false;
+  autoStepSegmentComplete = false;
+  autoIsrEarliestStepUs = 0;
+  autoIsrLastStepStartUs = 0;
+  interrupts();
+  releaseAutoStepMask(pulseMask);
+}
+
+void captureAutoPartialCommandedPosition() {
+  if (!autoSegmentActive || !autoInterpolationPlan.valid) return;
+  noInterrupts();
+  uint32_t emittedX = autoIsrEmittedX;
+  uint32_t emittedY = autoIsrEmittedY;
+  uint32_t emittedZ = autoIsrEmittedZ;
+  interrupts();
+
+  int64_t partialX = autoInterpolationPlan.deltaX < 0 ? -(int64_t)emittedX : emittedX;
+  int64_t partialY = autoInterpolationPlan.deltaY < 0 ? -(int64_t)emittedY : emittedY;
+  int64_t partialZ = autoInterpolationPlan.deltaZ < 0 ? -(int64_t)emittedZ : emittedZ;
+  autoCommandedX = (int32_t)((int64_t)autoCommandedX + partialX);
+  autoCommandedY = (int32_t)((int64_t)autoCommandedY + partialY);
+  autoCommandedZ = (int32_t)((int64_t)autoCommandedZ + partialZ);
+}
+
+void autoStepTimerIsr() {
+  if (!autoStepTimerRunning) {
+    autoStepTimer.end();
+    return;
+  }
+
+  if (!autoStepPulsePhase && autoIsrEarliestStepUs != 0) {
+    int32_t remainingUs = (int32_t)(autoIsrEarliestStepUs - micros());
+    if (remainingUs > 0) {
+      autoStepTimer.update((uint32_t)remainingUs);
+      return;
+    }
+    autoIsrEarliestStepUs = 0;
+  }
+
+  if (autoStepPulsePhase) {
+    bool finalPulse = autoIsrDominantStepIndex >= autoIsrDominantSteps;
+    if (finalPulse) autoStepTimer.end();
+    uint8_t pulseMask = autoStepPulseMask;
+    autoStepPulseMask = 0;
+    releaseAutoStepMask(pulseMask);
+
+    if (finalPulse) {
+      autoStepPulsePhase = false;
+      autoStepTimerRunning = false;
+      autoStepSegmentComplete = true;
+      return;
+    }
+
+    autoStepPulsePhase = false;
+    autoStepTimer.update(autoIsrStepIntervalUs - STEP_PULSE_US);
+    return;
+  }
+
+  uint8_t pulseMask = 0;
+  if (autoIsrAccumulatorX >= autoIsrDominantSteps - autoIsrAbsDeltaX) {
+    autoIsrAccumulatorX -= autoIsrDominantSteps - autoIsrAbsDeltaX;
+    pulseMask |= 0x01;
+    autoIsrEmittedX++;
+  } else {
+    autoIsrAccumulatorX += autoIsrAbsDeltaX;
+  }
+  if (autoIsrAccumulatorY >= autoIsrDominantSteps - autoIsrAbsDeltaY) {
+    autoIsrAccumulatorY -= autoIsrDominantSteps - autoIsrAbsDeltaY;
+    pulseMask |= 0x02;
+    autoIsrEmittedY++;
+  } else {
+    autoIsrAccumulatorY += autoIsrAbsDeltaY;
+  }
+  if (autoIsrAccumulatorZ >= autoIsrDominantSteps - autoIsrAbsDeltaZ) {
+    autoIsrAccumulatorZ -= autoIsrDominantSteps - autoIsrAbsDeltaZ;
+    pulseMask |= 0x04;
+    autoIsrEmittedZ++;
+  } else {
+    autoIsrAccumulatorZ += autoIsrAbsDeltaZ;
+  }
+
+  autoStepPulseMask = pulseMask;
+  autoIsrLastStepStartUs = micros();
+  if (pulseMask & 0x01) ocWrite(motorX.stepPin, LOW);
+  if (pulseMask & 0x02) ocWrite(motorY.stepPin, LOW);
+  if (pulseMask & 0x04) ocWrite(motorZ.stepPin, LOW);
+  autoIsrDominantStepIndex++;
+  autoStepPulsePhase = true;
+  autoStepTimer.update(STEP_PULSE_US);
+}
+
 void clearAutoFifo() {
+  stopAutoStepGeneration();
   autoFifoHead = 0;
   autoFifoTail = 0;
   autoFifoCount = 0;
   autoBufferLowReported = false;
+  autoSegmentActive = false;
+  memset(&autoInterpolationPlan, 0, sizeof(autoInterpolationPlan));
 }
 
 bool enqueueAutoSegment(const MotionSegment &segment) {
@@ -387,6 +591,14 @@ bool enqueueAutoSegment(const MotionSegment &segment) {
   autoFifoTail = (uint8_t)((autoFifoTail + 1) % AUTO_FIFO_CAPACITY);
   autoFifoCount++;
   if (autoFifoCount > AUTO_FIFO_LOW_WATERMARK) autoBufferLowReported = false;
+  return true;
+}
+
+bool dequeueAutoSegment(MotionSegment &segment) {
+  if (autoFifoCount == 0) return false;
+  segment = autoFifo[autoFifoHead];
+  autoFifoHead = (uint8_t)((autoFifoHead + 1) % AUTO_FIFO_CAPACITY);
+  autoFifoCount--;
   return true;
 }
 
@@ -404,6 +616,12 @@ void clearManualMotionRequests() {
   semiZ_sps = 0.0f;
 }
 
+void stopLegacyMotorOutputsForAuto() {
+  setMotorSpeed(motorX, 0.0f, MAX_SPEED_XY_SPS);
+  setMotorSpeed(motorY, 0.0f, MAX_SPEED_XY_SPS);
+  setMotorSpeed(motorZ, 0.0f, MAX_SPEED_Z_SPS);
+}
+
 void sendAutoError(const char *job, const char *code, uint32_t segmentId = 0) {
   char payload[150];
   if (segmentId > 0) {
@@ -417,8 +635,11 @@ void sendAutoError(const char *job, const char *code, uint32_t segmentId = 0) {
 }
 
 void enterAutoError(const char *code, uint32_t segmentId = 0) {
+  stopAutoStepGeneration();
+  captureAutoPartialCommandedPosition();
   clearAutoFifo();
   clearManualMotionRequests();
+  stopLegacyMotorOutputsForAuto();
   autoState = AUTO_ERROR;
   sendAutoError(autoJobId, code, segmentId);
 }
@@ -436,13 +657,38 @@ void sendAutoAck(const char *command, uint32_t segmentId = 0) {
 }
 
 void sendAutoStatus() {
-  char payload[170];
+  noInterrupts();
+  uint32_t emittedX = autoIsrEmittedX;
+  uint32_t emittedY = autoIsrEmittedY;
+  uint32_t emittedZ = autoIsrEmittedZ;
+  uint32_t isrStepIndex = autoIsrDominantStepIndex;
+  bool timerRunning = autoStepTimerRunning;
+  interrupts();
+
+  char payload[420];
   snprintf(payload, sizeof(payload),
-           "AUTO,STATUS,JOB:%s,STATE:%s,Q:%u,FREE:%u,LAST:%lu,EXEC:0,"
-           "AUTO_ACTIVE:%u,MANUAL_BLOCKED:%u",
+           "AUTO,STATUS,JOB:%s,STATE:%s,Q:%u,FREE:%u,LAST:%lu,EXEC:%u,"
+           "ACTIVE:%lu,LAST_DONE:%lu,LOGICAL_RUN:0,STEP_RUN:%u,"
+           "AUTO_ACTIVE:%u,MANUAL_BLOCKED:%u,"
+           "CMDX:%ld,CMDY:%ld,CMDZ:%ld,PLAN:%u,DOM:%c,DOM_STEPS:%lu,"
+           "STEP_US:%.3f,CALC_US:%lu,TEST_T_US:%lu,ISR_STEP:%lu,"
+           "EMITX:%lu,EMITY:%lu,EMITZ:%lu",
            safeAutoJob(autoJobId), autoStateName(), autoFifoCount, autoFifoFree(),
            (unsigned long)autoLastAcceptedSegmentId,
-           autoModeActive() ? 1 : 0, autoModeActive() ? 1 : 0);
+           autoSegmentActive ? 1 : 0,
+           (unsigned long)(autoSegmentActive ? autoActiveSegment.id : 0),
+           (unsigned long)autoLastCompletedSegmentId,
+           timerRunning ? 1 : 0,
+           autoModeActive() ? 1 : 0, autoModeActive() ? 1 : 0,
+           (long)autoCommandedX, (long)autoCommandedY, (long)autoCommandedZ,
+           autoInterpolationPlan.valid ? 1 : 0,
+           autoInterpolationPlan.valid ? autoInterpolationPlan.dominantAxis : '-',
+           (unsigned long)autoInterpolationPlan.dominantSteps,
+           autoInterpolationPlan.dominantStepIntervalUs,
+           (unsigned long)autoInterpolationPlan.calculatedDurationUs,
+           (unsigned long)(autoSegmentActive ? autoActiveSegment.durationUs : 0),
+           (unsigned long)isrStepIndex, (unsigned long)emittedX,
+           (unsigned long)emittedY, (unsigned long)emittedZ);
   sendAutoPayload(payload);
 }
 
@@ -457,6 +703,194 @@ void sendAutoBufferLowIfNeeded() {
            (unsigned long)autoLastAcceptedSegmentId);
   sendAutoPayload(payload);
   autoBufferLowReported = true;
+}
+
+void sendAutoCompleted() {
+  if (autoCompletedReported) return;
+  char payload[120];
+  snprintf(payload, sizeof(payload), "AUTO,COMPLETED,JOB:%s,LAST:%lu",
+           safeAutoJob(autoJobId), (unsigned long)autoLastCompletedSegmentId);
+  sendAutoPayload(payload);
+  autoCompletedReported = true;
+}
+
+uint32_t autoDeltaMagnitude(int64_t delta) {
+  return (uint32_t)(delta < 0 ? -delta : delta);
+}
+
+bool prepareAutoInterpolation(const MotionSegment &segment) {
+  memset(&autoInterpolationPlan, 0, sizeof(autoInterpolationPlan));
+  autoInterpolationPlan.targetX = segment.targetX;
+  autoInterpolationPlan.targetY = segment.targetY;
+  autoInterpolationPlan.targetZ = segment.targetZ;
+  autoInterpolationPlan.deltaX = (int64_t)segment.targetX - autoCommandedX;
+  autoInterpolationPlan.deltaY = (int64_t)segment.targetY - autoCommandedY;
+  autoInterpolationPlan.deltaZ = (int64_t)segment.targetZ - autoCommandedZ;
+  autoInterpolationPlan.absDeltaX = autoDeltaMagnitude(autoInterpolationPlan.deltaX);
+  autoInterpolationPlan.absDeltaY = autoDeltaMagnitude(autoInterpolationPlan.deltaY);
+  autoInterpolationPlan.absDeltaZ = autoDeltaMagnitude(autoInterpolationPlan.deltaZ);
+  autoInterpolationPlan.feedMmS = segment.feedMmS;
+
+  autoInterpolationPlan.dominantSteps = autoInterpolationPlan.absDeltaX;
+  autoInterpolationPlan.dominantAxis = 'X';
+  if (autoInterpolationPlan.absDeltaY > autoInterpolationPlan.dominantSteps) {
+    autoInterpolationPlan.dominantSteps = autoInterpolationPlan.absDeltaY;
+    autoInterpolationPlan.dominantAxis = 'Y';
+  }
+  if (autoInterpolationPlan.absDeltaZ > autoInterpolationPlan.dominantSteps) {
+    autoInterpolationPlan.dominantSteps = autoInterpolationPlan.absDeltaZ;
+    autoInterpolationPlan.dominantAxis = 'Z';
+  }
+
+  if (autoInterpolationPlan.deltaX != 0) {
+    ocWrite(motorX.dirPin, autoInterpolationPlan.deltaX > 0 ? HIGH : LOW);
+  }
+  if (autoInterpolationPlan.deltaY != 0) {
+    ocWrite(motorY.dirPin, autoInterpolationPlan.deltaY > 0 ? HIGH : LOW);
+  }
+  if (autoInterpolationPlan.deltaZ != 0) {
+    ocWrite(motorZ.dirPin, autoInterpolationPlan.deltaZ > 0 ? HIGH : LOW);
+  }
+
+  if (autoInterpolationPlan.dominantSteps == 0) {
+    autoInterpolationPlan.dominantAxis = '-';
+    autoInterpolationPlan.valid = true;
+    return true;
+  }
+  if (autoPulsesPerMmX <= 0.0f || autoPulsesPerMmY <= 0.0f ||
+      autoPulsesPerMmZ <= 0.0f || segment.feedMmS <= 0.0f) {
+    return false;
+  }
+
+  double dxMm = (double)autoInterpolationPlan.absDeltaX / autoPulsesPerMmX;
+  double dyMm = (double)autoInterpolationPlan.absDeltaY / autoPulsesPerMmY;
+  double dzMm = (double)autoInterpolationPlan.absDeltaZ / autoPulsesPerMmZ;
+  double pathLengthMm = sqrt(dxMm * dxMm + dyMm * dyMm + dzMm * dzMm);
+  double calculatedDurationUs = (pathLengthMm / segment.feedMmS) * 1000000.0;
+  double dominantStepIntervalUs = calculatedDurationUs / autoInterpolationPlan.dominantSteps;
+  double durationSeconds = calculatedDurationUs / 1000000.0;
+  if (!isfinite(pathLengthMm) || pathLengthMm <= 0.0 ||
+      !isfinite(calculatedDurationUs) || calculatedDurationUs < 1.0 ||
+      calculatedDurationUs > UINT32_MAX || !isfinite(dominantStepIntervalUs) ||
+      dominantStepIntervalUs <= 0.0 ||
+      ((double)autoInterpolationPlan.absDeltaX / durationSeconds) > MAX_SPEED_XY_SPS ||
+      ((double)autoInterpolationPlan.absDeltaY / durationSeconds) > MAX_SPEED_XY_SPS ||
+      ((double)autoInterpolationPlan.absDeltaZ / durationSeconds) > MAX_SPEED_Z_SPS) {
+    return false;
+  }
+
+  uint32_t roundedStepIntervalUs = (uint32_t)(dominantStepIntervalUs + 0.5);
+  if (roundedStepIntervalUs < STEP_PULSE_US + AUTO_MIN_STEP_HIGH_US ||
+      roundedStepIntervalUs > AUTO_MAX_TIMER_INTERVAL_US) return false;
+
+  autoInterpolationPlan.pathLengthMm = (float)pathLengthMm;
+  autoInterpolationPlan.calculatedDurationUs = (uint32_t)(calculatedDurationUs + 0.5);
+  autoInterpolationPlan.dominantStepIntervalUs = (float)dominantStepIntervalUs;
+  autoInterpolationPlan.valid = true;
+  return true;
+}
+
+bool startNextAutoStepSegment() {
+  if (autoState != AUTO_RUNNING || autoSegmentActive) return false;
+  if (!dequeueAutoSegment(autoActiveSegment)) {
+    sendAutoBufferLowIfNeeded();
+    return false;
+  }
+  if (!prepareAutoInterpolation(autoActiveSegment)) {
+    enterAutoError("BAD_PLAN", autoActiveSegment.id);
+    return false;
+  }
+  autoSegmentActive = true;
+  sendAutoBufferLowIfNeeded();
+
+  noInterrupts();
+  autoIsrAbsDeltaX = autoInterpolationPlan.absDeltaX;
+  autoIsrAbsDeltaY = autoInterpolationPlan.absDeltaY;
+  autoIsrAbsDeltaZ = autoInterpolationPlan.absDeltaZ;
+  autoIsrDominantSteps = autoInterpolationPlan.dominantSteps;
+  autoIsrAccumulatorX = 0;
+  autoIsrAccumulatorY = 0;
+  autoIsrAccumulatorZ = 0;
+  autoIsrDominantStepIndex = 0;
+  autoIsrEmittedX = 0;
+  autoIsrEmittedY = 0;
+  autoIsrEmittedZ = 0;
+  autoStepPulseMask = 0;
+  autoStepPulsePhase = false;
+  autoStepSegmentComplete = autoInterpolationPlan.dominantSteps == 0;
+  autoIsrStepIntervalUs =
+      (uint32_t)(autoInterpolationPlan.dominantStepIntervalUs + 0.5f);
+  interrupts();
+
+  if (autoInterpolationPlan.dominantSteps == 0) return true;
+
+  uint32_t nowUs = micros();
+  uint32_t firstEventDelayUs = autoIsrStepIntervalUs;
+  noInterrupts();
+  uint32_t previousStepStartUs = autoIsrLastStepStartUs;
+  interrupts();
+  if (previousStepStartUs != 0) {
+    uint32_t nextStepDueUs = previousStepStartUs + autoIsrStepIntervalUs;
+    int32_t remainingUs = (int32_t)(nextStepDueUs - nowUs);
+    firstEventDelayUs = remainingUs > 0 ? (uint32_t)remainingUs : 1;
+  }
+  // prepareAutoInterpolation() può avere appena aggiornato DIR: la continuità
+  // non deve mai ridurre il tempo minimo di setup della direzione.
+  if (firstEventDelayUs < AUTO_DIR_SETUP_US) firstEventDelayUs = AUTO_DIR_SETUP_US;
+  noInterrupts();
+  autoIsrEarliestStepUs = nowUs + firstEventDelayUs;
+  autoStepTimerRunning = true;
+  interrupts();
+  if (!autoStepTimer.begin(autoStepTimerIsr, firstEventDelayUs)) {
+    autoStepTimerRunning = false;
+    autoIsrEarliestStepUs = 0;
+    enterAutoError("TIMER_START", autoActiveSegment.id);
+    return false;
+  }
+  autoStepTimer.priority(64);
+  return true;
+}
+
+void updateAutoStepExecution() {
+  if (autoState != AUTO_RUNNING) return;
+  if (!autoSegmentActive) {
+    startNextAutoStepSegment();
+    return;
+  }
+
+  noInterrupts();
+  bool segmentComplete = autoStepSegmentComplete;
+  uint32_t emittedX = autoIsrEmittedX;
+  uint32_t emittedY = autoIsrEmittedY;
+  uint32_t emittedZ = autoIsrEmittedZ;
+  uint32_t dominantStepIndex = autoIsrDominantStepIndex;
+  if (segmentComplete) autoStepSegmentComplete = false;
+  interrupts();
+  if (!segmentComplete) return;
+
+  if (emittedX != autoInterpolationPlan.absDeltaX ||
+      emittedY != autoInterpolationPlan.absDeltaY ||
+      emittedZ != autoInterpolationPlan.absDeltaZ ||
+      dominantStepIndex != autoInterpolationPlan.dominantSteps) {
+    enterAutoError("STEP_COUNT", autoActiveSegment.id);
+    return;
+  }
+
+  autoInterpolationPlan.dominantStepIndex = dominantStepIndex;
+  autoLastCompletedSegmentId = autoActiveSegment.id;
+  autoCommandedX = autoActiveSegment.targetX;
+  autoCommandedY = autoActiveSegment.targetY;
+  autoCommandedZ = autoActiveSegment.targetZ;
+  bool endProgram = autoActiveSegment.endProgram;
+  autoSegmentActive = false;
+
+  if (endProgram) {
+    autoState = AUTO_COMPLETED;
+    sendAutoCompleted();
+    return;
+  }
+
+  startNextAutoStepSegment();
 }
 
 bool parseUint32Strict(const char *text, uint32_t &value) {
@@ -505,29 +939,6 @@ bool copyAutoToken(char *destination, size_t capacity, const char *source) {
   return true;
 }
 
-struct AutoParsedFields {
-  char job[AUTO_JOB_ID_CAPACITY];
-  char reason[25];
-  uint32_t totalSegments;
-  uint32_t id;
-  int32_t x;
-  int32_t y;
-  int32_t z;
-  float feed;
-  uint32_t durationUs;
-  bool endProgram;
-  bool hasJob;
-  bool hasReason;
-  bool hasTotalSegments;
-  bool hasId;
-  bool hasX;
-  bool hasY;
-  bool hasZ;
-  bool hasFeed;
-  bool hasDuration;
-  bool hasEnd;
-};
-
 void initAutoParsedFields(AutoParsedFields &fields) {
   memset(&fields, 0, sizeof(fields));
 }
@@ -574,9 +985,45 @@ bool parseAutoField(char *token, AutoParsedFields &fields) {
     fields.hasZ = true;
     return true;
   }
+  if (strcmp(key, "CX") == 0) {
+    if (fields.hasCurrentX || !parseInt32Strict(value, fields.currentX)) return false;
+    fields.hasCurrentX = true;
+    return true;
+  }
+  if (strcmp(key, "CY") == 0) {
+    if (fields.hasCurrentY || !parseInt32Strict(value, fields.currentY)) return false;
+    fields.hasCurrentY = true;
+    return true;
+  }
+  if (strcmp(key, "CZ") == 0) {
+    if (fields.hasCurrentZ || !parseInt32Strict(value, fields.currentZ)) return false;
+    fields.hasCurrentZ = true;
+    return true;
+  }
   if (strcmp(key, "F") == 0) {
     if (fields.hasFeed || !parsePositiveFloatStrict(value, fields.feed)) return false;
     fields.hasFeed = true;
+    return true;
+  }
+  if (strcmp(key, "PX") == 0) {
+    if (fields.hasPulsesPerMmX || !parsePositiveFloatStrict(value, fields.pulsesPerMmX)) {
+      return false;
+    }
+    fields.hasPulsesPerMmX = true;
+    return true;
+  }
+  if (strcmp(key, "PY") == 0) {
+    if (fields.hasPulsesPerMmY || !parsePositiveFloatStrict(value, fields.pulsesPerMmY)) {
+      return false;
+    }
+    fields.hasPulsesPerMmY = true;
+    return true;
+  }
+  if (strcmp(key, "PZ") == 0) {
+    if (fields.hasPulsesPerMmZ || !parsePositiveFloatStrict(value, fields.pulsesPerMmZ)) {
+      return false;
+    }
+    fields.hasPulsesPerMmZ = true;
     return true;
   }
   if (strcmp(key, "T") == 0) {
@@ -600,7 +1047,9 @@ bool autoJobMatches(const char *job) {
 
 void processAutoCommand(const char *command, const AutoParsedFields &fields) {
   if (strcmp(command, "BEGIN") == 0) {
-    if (!fields.hasJob || !fields.hasTotalSegments || fields.totalSegments == 0) {
+    if (!fields.hasJob || !fields.hasTotalSegments || fields.totalSegments == 0 ||
+        !fields.hasCurrentX || !fields.hasCurrentY || !fields.hasCurrentZ ||
+        !fields.hasPulsesPerMmX || !fields.hasPulsesPerMmY || !fields.hasPulsesPerMmZ) {
       sendAutoError(fields.hasJob ? fields.job : "NONE", "BAD_BEGIN");
       return;
     }
@@ -611,7 +1060,12 @@ void processAutoCommand(const char *command, const AutoParsedFields &fields) {
     }
     if (autoJobMatches(fields.job) &&
         (autoState == AUTO_BUFFERING || autoState == AUTO_RUNNING)) {
-      if (fields.totalSegments != autoTotalSegments) {
+      if (fields.totalSegments != autoTotalSegments ||
+          fields.currentX != autoJobStartX || fields.currentY != autoJobStartY ||
+          fields.currentZ != autoJobStartZ ||
+          fields.pulsesPerMmX != autoPulsesPerMmX ||
+          fields.pulsesPerMmY != autoPulsesPerMmY ||
+          fields.pulsesPerMmZ != autoPulsesPerMmZ) {
         sendAutoError(fields.job, "BAD_BEGIN");
         return;
       }
@@ -622,11 +1076,23 @@ void processAutoCommand(const char *command, const AutoParsedFields &fields) {
 
     clearAutoFifo();
     clearManualMotionRequests();
+    stopLegacyMotorOutputsForAuto();
     strncpy(autoJobId, fields.job, sizeof(autoJobId) - 1);
     autoJobId[sizeof(autoJobId) - 1] = '\0';
     autoTotalSegments = fields.totalSegments;
     autoExpectedSegmentId = 1;
     autoLastAcceptedSegmentId = 0;
+    autoLastCompletedSegmentId = 0;
+    autoCompletedReported = false;
+    autoCommandedX = fields.currentX;
+    autoCommandedY = fields.currentY;
+    autoCommandedZ = fields.currentZ;
+    autoJobStartX = fields.currentX;
+    autoJobStartY = fields.currentY;
+    autoJobStartZ = fields.currentZ;
+    autoPulsesPerMmX = fields.pulsesPerMmX;
+    autoPulsesPerMmY = fields.pulsesPerMmY;
+    autoPulsesPerMmZ = fields.pulsesPerMmZ;
     autoState = AUTO_BUFFERING;
     sendAutoAck("BEGIN");
     return;
@@ -641,7 +1107,8 @@ void processAutoCommand(const char *command, const AutoParsedFields &fields) {
       sendAutoError(fields.job, "JOB_MISMATCH");
       return;
     }
-    if (autoState != AUTO_STOPPED && autoState != AUTO_ERROR && autoState != AUTO_IDLE) {
+    if (autoState != AUTO_COMPLETED && autoState != AUTO_STOPPED &&
+        autoState != AUTO_ERROR && autoState != AUTO_IDLE) {
       sendAutoError(safeAutoJob(autoJobId), "BAD_STATE");
       return;
     }
@@ -651,10 +1118,22 @@ void processAutoCommand(const char *command, const AutoParsedFields &fields) {
     }
     clearAutoFifo();
     clearManualMotionRequests();
+    stopLegacyMotorOutputsForAuto();
     autoState = AUTO_IDLE;
     autoExpectedSegmentId = 1;
     autoLastAcceptedSegmentId = 0;
+    autoLastCompletedSegmentId = 0;
     autoTotalSegments = 0;
+    autoCompletedReported = false;
+    autoCommandedX = 0;
+    autoCommandedY = 0;
+    autoCommandedZ = 0;
+    autoJobStartX = 0;
+    autoJobStartY = 0;
+    autoJobStartZ = 0;
+    autoPulsesPerMmX = 0.0f;
+    autoPulsesPerMmY = 0.0f;
+    autoPulsesPerMmZ = 0.0f;
     sendAutoAck("RESET");
     autoJobId[0] = '\0';
     return;
@@ -726,21 +1205,25 @@ void processAutoCommand(const char *command, const AutoParsedFields &fields) {
       return;
     }
     clearManualMotionRequests();
+    stopLegacyMotorOutputsForAuto();
     autoState = AUTO_RUNNING;
     sendAutoAck("RUN");
-    sendAutoBufferLowIfNeeded();
+    startNextAutoStepSegment();
     return;
   }
 
   if (strcmp(command, "STOP") == 0) {
-    uint32_t lastAccepted = autoLastAcceptedSegmentId;
+    uint32_t lastCompleted = autoLastCompletedSegmentId;
+    stopAutoStepGeneration();
+    captureAutoPartialCommandedPosition();
     clearAutoFifo();
     clearManualMotionRequests();
+    stopLegacyMotorOutputsForAuto();
     autoState = AUTO_STOPPED;
     sendAutoAck("STOP");
     char payload[150];
     snprintf(payload, sizeof(payload), "AUTO,STOPPED,JOB:%s,LAST:%lu,REASON:%s",
-             safeAutoJob(autoJobId), (unsigned long)lastAccepted,
+             safeAutoJob(autoJobId), (unsigned long)lastCompleted,
              fields.hasReason ? fields.reason : "USER");
     sendAutoPayload(payload);
     return;
@@ -911,10 +1394,7 @@ float chooseSemiAxisSpeed(float jogSpeed, uint8_t plusPin, uint8_t minusPin, flo
 
 void applyRequestedSpeeds() {
   if (autoModeActive()) {
-    // Nessun segmento AUTO viene ancora eseguito: durante AUTO ogni asse resta fermo.
-    setMotorSpeed(motorX, 0.0f, MAX_SPEED_XY_SPS);
-    setMotorSpeed(motorY, 0.0f, MAX_SPEED_XY_SPS);
-    setMotorSpeed(motorZ, 0.0f, MAX_SPEED_Z_SPS);
+    // Il timer AUTO possiede STEP/DIR; il polling manuale non deve toccare le uscite.
     return;
   }
 
@@ -964,6 +1444,7 @@ void loop() {
   static uint32_t lastMs = 0;
 
   readUartCommands();
+  updateAutoStepExecution();
   applyRequestedSpeeds();
 
   updateMotor(motorX);

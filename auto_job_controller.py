@@ -20,6 +20,7 @@ class AutoJobState(Enum):
     RUN_SENT = "RUN_SENT"
     RUNNING = "RUNNING"
     STOPPING = "STOPPING"
+    RESET_SENT = "RESET_SENT"
     STOPPED = "STOPPED"
     COMPLETED = "COMPLETED"
     ERROR = "ERROR"
@@ -89,8 +90,9 @@ class AutoJobController:
         self.last_acked_segment = 0
         self.buffer_low_events = 0
         self.last_error = None
+        self.last_status = None
 
-    def start_job(self, segments):
+    def start_job(self, segments, *, current_position_steps, pulses_per_mm):
         if self.state not in (
             AutoJobState.IDLE,
             AutoJobState.COMPLETED,
@@ -105,13 +107,40 @@ class AutoJobController:
         if not all(isinstance(segment, AutoSegment) for segment in segments):
             raise TypeError("Tutti i segmenti devono essere AutoSegment")
 
+        current_position_steps = tuple(current_position_steps)
+        pulses_per_mm = tuple(pulses_per_mm)
+        if len(current_position_steps) != 3 or any(
+            isinstance(value, bool) or not isinstance(value, int)
+            for value in current_position_steps
+        ):
+            raise ValueError("current_position_steps deve contenere tre interi X/Y/Z")
+        if len(pulses_per_mm) != 3 or any(
+            isinstance(value, bool) or
+            not isinstance(value, (int, float)) or
+            not math.isfinite(value) or value <= 0
+            for value in pulses_per_mm
+        ):
+            raise ValueError("pulses_per_mm deve contenere tre valori positivi X/Y/Z")
+
         self.reset()
         self.job_id = str(self.job_id_factory())
         self.segments = segments
+        self.current_position_steps = current_position_steps
+        self.pulses_per_mm = tuple(float(value) for value in pulses_per_mm)
         self.state = AutoJobState.BEGIN_SENT
         self._send_pending(
             "BEGIN",
-            encode_auto_message("BEGIN", JOB=self.job_id, N=len(self.segments)),
+            encode_auto_message(
+                "BEGIN",
+                JOB=self.job_id,
+                N=len(self.segments),
+                CX=current_position_steps[0],
+                CY=current_position_steps[1],
+                CZ=current_position_steps[2],
+                PX=self.pulses_per_mm[0],
+                PY=self.pulses_per_mm[1],
+                PZ=self.pulses_per_mm[2],
+            ),
         )
         return self.job_id
 
@@ -125,6 +154,9 @@ class AutoJobController:
 
         try:
             message = decode_auto_message(line)
+            if message.command == "STATUS":
+                self.last_status = dict(message.fields)
+                return True
             message_job = require_field(message, "JOB")
             if self.job_id is None or message_job != self.job_id:
                 raise AutoProtocolError(f"JOB inatteso: {message_job}")
@@ -166,6 +198,26 @@ class AutoJobController:
             encode_auto_message("STOP", JOB=self.job_id, REASON=reason),
         )
         return True
+
+    def request_reset(self):
+        if self.state not in (
+            AutoJobState.IDLE,
+            AutoJobState.COMPLETED,
+            AutoJobState.STOPPED,
+            AutoJobState.ERROR,
+        ):
+            raise RuntimeError(f"RESET non consentito nello stato {self.state.value}")
+        if self.job_id is None:
+            self.job_id = str(self.job_id_factory())
+        self.pending.clear()
+        self.state = AutoJobState.RESET_SENT
+        self._send_pending(
+            "RESET",
+            encode_auto_message("RESET", JOB=self.job_id),
+        )
+
+    def request_status(self):
+        self.send_line(encode_auto_message("STATUS", JOB=self.job_id or "STATUS"))
 
     def _dispatch_message(self, message):
         if message.command == "ACK":
@@ -224,6 +276,12 @@ class AutoJobController:
         if command == "STOP":
             if self.state == AutoJobState.STOPPING:
                 self.pending.pop("STOP", None)
+            return
+
+        if command == "RESET":
+            if "RESET" not in self.pending:
+                return
+            self.reset()
             return
 
         raise AutoProtocolError(f"ACK per comando sconosciuto: {command}")

@@ -1,6 +1,8 @@
 import threading
 import time
 import re
+import math
+import queue
 import tkinter as tk
 
 try:
@@ -9,8 +11,10 @@ except Exception:
     serial = None
 
 from manuale_v8 import ManualeFrame
+from auto_job_controller import AutoJobController, AutoJobState, AutoSegment
 from settings_frame import SettingsFrame
 from settings_store import DEFAULT_CONFIG_PATH, load_settings, save_settings
+from test_auto_frame import TestAutoFrame
 try:
     from spianatura_xy_v5 import SpianaturaXYFrame
 except Exception:
@@ -59,10 +63,13 @@ class DROApp(tk.Tk):
         self.container = tk.Frame(self, bg="#101010")
         self.container.pack(fill="both", expand=True)
         self.current_frame = None
+        self.auto_rx_queue = queue.Queue()
+        self.auto_controller = AutoJobController(self.write_auto_line)
 
         self.start_serial_reader()
         self.show_main_menu()
         self.after(50, self.manual_keepalive_task)
+        self.after(20, self.auto_service_task)
 
     def exit_fullscreen(self, event=None):
         self.attributes("-fullscreen", False)
@@ -93,7 +100,8 @@ class DROApp(tk.Tk):
 
     def manual_keepalive_task(self):
         now = time.time()
-        if (now - self.last_manual_send_time) >= self.manual_keepalive_interval_s:
+        if (self.auto_controller.state == AutoJobState.IDLE and
+                (now - self.last_manual_send_time) >= self.manual_keepalive_interval_s):
             self.write_jog_command(self.last_manual_cmd)
             self.write_semi_command(self.last_semi_cmd["x"], self.last_semi_cmd["y"])
             self.last_manual_send_time = now
@@ -183,11 +191,16 @@ class DROApp(tk.Tk):
                      font=("Arial", 14, "bold"), fg="#f0b84b", bg="#101010").grid(
                          row=2, column=0, sticky="s", padx=20, pady=20)
 
-        tk.Button(frame, text="SETTINGS", command=self.show_settings,
+        test_tools = tk.Frame(frame, bg="#101010")
+        test_tools.grid(row=2, column=0, sticky="sw", padx=20, pady=20)
+        tk.Button(test_tools, text="SETTINGS", command=self.show_settings,
                   font=("Arial", 18, "bold"), bg="#2d7ef7", fg="white",
                   activebackground="#4d96ff", activeforeground="white",
-                  relief="flat", bd=0, padx=18, pady=10).grid(
-                      row=2, column=0, sticky="sw", padx=20, pady=20)
+                  relief="flat", bd=0, padx=18, pady=10).pack(side="left", padx=(0, 10))
+        tk.Button(test_tools, text="TEST AUTO", command=self.show_test_auto,
+                  font=("Arial", 18, "bold"), bg="#aa7a18", fg="white",
+                  activebackground="#c5921e", activeforeground="white",
+                  relief="flat", bd=0, padx=18, pady=10).pack(side="left")
 
         tk.Button(frame, text="ESCI", command=self.destroy, font=("Arial", 18, "bold"),
                   bg="#aa2e25", fg="white", activebackground="#c23c32",
@@ -234,12 +247,124 @@ class DROApp(tk.Tk):
         )
         self.current_frame.pack(fill="both", expand=True)
 
+    def show_test_auto(self):
+        self.clear_current_frame()
+        self.current_frame = TestAutoFrame(
+            self.container,
+            on_back=self.show_main_menu,
+            on_move=self.start_auto_test_move,
+            on_two_segments=self.start_auto_test_two_x_segments,
+            on_stop=self.stop_auto_test,
+            on_reset=self.reset_auto_test,
+            on_status=self.request_auto_status,
+            get_state=self.get_auto_controller_state,
+            pulses_per_mm=dict(self.pulses_per_mm),
+            provisional_settings=self.using_provisional_settings,
+            bg="#101010",
+        )
+        self.current_frame.pack(fill="both", expand=True)
+        self.current_frame.append_line("Pagina test pronta. Nessun job inviato.")
+
     def save_pulses_per_mm(self, values):
         saved_values = save_settings(values, self.settings_path)
         self.pulses_per_mm = saved_values
         self.settings_notice = f"Settings caricati da {self.settings_path}"
         self.using_provisional_settings = False
         return dict(saved_values)
+
+    def get_auto_controller_state(self):
+        return self.auto_controller.state.value
+
+    def append_auto_log(self, line):
+        if isinstance(self.current_frame, TestAutoFrame):
+            self.current_frame.append_line(line)
+            self.current_frame.refresh_state()
+
+    def write_auto_line(self, line):
+        if self.serial_conn is None:
+            raise RuntimeError("Seriale Teensy non disponibile")
+        with self.serial_lock:
+            self.serial_conn.write(line.encode("ascii"))
+            self.serial_conn.flush()
+        self.append_auto_log(f"TX> {line.strip()}")
+
+    def start_auto_test_move(self, delta_steps):
+        if self.serial_conn is None:
+            raise RuntimeError("Seriale Teensy non disponibile")
+        pulses = tuple(float(self.pulses_per_mm[axis]) for axis in ("X", "Y", "Z"))
+        dx, dy, dz = (int(value) for value in delta_steps)
+        dominant_steps = max(abs(dx), abs(dy), abs(dz))
+        if dominant_steps == 0:
+            raise ValueError("Movimento test nullo")
+
+        path_mm = math.sqrt(
+            (dx / pulses[0]) ** 2 +
+            (dy / pulses[1]) ** 2 +
+            (dz / pulses[2]) ** 2
+        )
+        duration_s = dominant_steps / 100.0
+        feed_mm_s = path_mm / duration_s
+        segment = AutoSegment(dx, dy, dz, feed_mm_s, int(duration_s * 1_000_000))
+        job_id = self.auto_controller.start_job(
+            [segment],
+            current_position_steps=(0, 0, 0),
+            pulses_per_mm=pulses,
+        )
+        return (f"Job {job_id}: target X={dx} Y={dy} Z={dz}, "
+                f"feed={feed_mm_s:.4f} mm/s, ~100 step/s dominante")
+
+    def start_auto_test_two_x_segments(self):
+        if self.serial_conn is None:
+            raise RuntimeError("Seriale Teensy non disponibile")
+        pulses = tuple(float(self.pulses_per_mm[axis]) for axis in ("X", "Y", "Z"))
+        feed_mm_s = 100.0 / pulses[0]
+        segments = [
+            AutoSegment(50, 0, 0, feed_mm_s, 500_000),
+            AutoSegment(100, 0, 0, feed_mm_s, 500_000),
+        ]
+        job_id = self.auto_controller.start_job(
+            segments,
+            current_position_steps=(0, 0, 0),
+            pulses_per_mm=pulses,
+        )
+        return (f"Job {job_id}: 2 segmenti X 0→50→100, "
+                f"feed={feed_mm_s:.4f} mm/s, ~100 step/s")
+
+    def stop_auto_test(self):
+        if self.serial_conn is None:
+            raise RuntimeError("Seriale Teensy non disponibile")
+        if self.auto_controller.stop("GUI_TEST"):
+            return "STOP AUTO inviato"
+        return f"STOP non necessario nello stato {self.auto_controller.state.value}"
+
+    def reset_auto_test(self):
+        if self.serial_conn is None:
+            raise RuntimeError("Seriale Teensy non disponibile")
+        self.auto_controller.request_reset()
+        return "RESET AUTO inviato"
+
+    def request_auto_status(self):
+        if self.serial_conn is None:
+            raise RuntimeError("Seriale Teensy non disponibile")
+        self.auto_controller.request_status()
+        return "STATUS richiesto"
+
+    def auto_service_task(self):
+        try:
+            while True:
+                line = self.auto_rx_queue.get_nowait()
+                self.append_auto_log(f"RX< {line}")
+                self.auto_controller.handle_line(line)
+                if isinstance(self.current_frame, TestAutoFrame):
+                    self.current_frame.refresh_state()
+        except queue.Empty:
+            pass
+
+        try:
+            self.auto_controller.tick()
+        except Exception as exc:
+            self.append_auto_log(f"AUTO ERROR: {exc}")
+        self.after(20, self.auto_service_task)
 
     def show_placeholder(self, text):
         self.clear_current_frame()
@@ -290,6 +415,9 @@ class DROApp(tk.Tk):
         # Per evitare derive apparenti della quota, NON aggiorniamo un asse se
         # la riga e' incompleta, contiene caratteri sporchi o valori non interi.
         line = line.strip()
+        if line.startswith("AUTO,"):
+            self.auto_rx_queue.put(line)
+            return
         match = re.fullmatch(r"X:([-+]?\d+),Y:([-+]?\d+),Z:([-+]?\d+)", line)
         if not match:
             return
