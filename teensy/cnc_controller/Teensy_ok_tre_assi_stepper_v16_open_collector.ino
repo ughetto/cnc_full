@@ -13,39 +13,61 @@
 #define CS_Z 8
 
 // =========================
+// Selezione sorgenti breakout - uscite push-pull 3,3 V
+// =========================
+constexpr uint8_t ENABLE_X_SELECT_PIN = 32;
+constexpr uint8_t ENABLE_Y_SELECT_PIN = 33;
+constexpr uint8_t CONTROL_Z_SELECT_PIN = 36;
+constexpr uint8_t MACH3_SELECT_PIN = 37;
+
+// NC a GND: LOW libero, HIGH premuto/cavo interrotto. Solo 3,3 V.
+// Il finecorsa software NON sostituisce un E-stop cablato.
+constexpr uint8_t LIMIT_X_MINUS_PIN = 40;
+constexpr uint8_t LIMIT_X_PLUS_PIN  = 41;
+constexpr uint8_t LIMIT_Y_MINUS_PIN = 22;
+constexpr uint8_t LIMIT_Y_PLUS_PIN  = 23;
+constexpr uint8_t LIMIT_Z_TOP_PIN   = 20;
+constexpr uint8_t ALARM_OUTPUT_PIN = 21;
+const uint8_t limitPins[5] = {LIMIT_X_MINUS_PIN, LIMIT_X_PLUS_PIN,
+                             LIMIT_Y_MINUS_PIN, LIMIT_Y_PLUS_PIN, LIMIT_Z_TOP_PIN};
+// Bit 0..4, stesso ordine per STATUS corrente e latched.
+const char *const limitNames[5] = {"X_MINUS", "X_PLUS", "Y_MINUS", "Y_PLUS", "Z_TOP"};
+const char *const limitErrors[5] = {"LIMIT_X_MINUS", "LIMIT_X_PLUS",
+                                   "LIMIT_Y_MINUS", "LIMIT_Y_PLUS", "LIMIT_Z_TOP"};
+uint8_t limitCurrentMask = 0;
+uint8_t limitLatchedMask = 0;
+uint8_t limitAutoResetMask = 0;  // Un trip AUTO richiede RESET anche dopo STOP.
+volatile uint8_t limitPendingMask = 0;
+uint32_t limitReleaseSinceMs[5] = {};
+const uint32_t LIMIT_RELEASE_DEBOUNCE_MS = 30;
+
+// =========================
 // Driver stepper - pin asse X
 // =========================
 #define X_STEP_PIN 2
 #define X_DIR_PIN  3
-#define X_EN_PIN   4
 
 // =========================
 // Driver stepper - pin asse Y
 // =========================
 #define Y_STEP_PIN 5
 #define Y_DIR_PIN  6
-#define Y_EN_PIN   7
 
 // =========================
 // Driver stepper - pin asse Z
 // =========================
 #define Z_STEP_PIN 14
 #define Z_DIR_PIN  15
-#define Z_EN_PIN   16
 
 // =========================
 // Commutatori semiautomatici ON-OFF-ON
 // Comune commutatori a GND, ingressi con INPUT_PULLUP.
-// ATTENZIONE: non usare 2-7 per questi ingressi, sono gia STEP/DIR/EN.
+// ATTENZIONE: non usare 2, 3, 5 e 6: sono gia STEP/DIR degli assi X/Y.
 // =========================
 #define SEMI_X_PLUS_PIN  24
 #define SEMI_X_MINUS_PIN 25
 #define SEMI_Y_PLUS_PIN  26
 #define SEMI_Y_MINUS_PIN 27
-
-// Se il driver si abilita con livello LOW lascia true.
-// Se invece si abilita con HIGH metti false.
-#define ENABLE_ACTIVE_LOW true
 
 // Velocità massima manuale richiesta
 const float MAX_SPEED_XY_SPS = 1600.0f;
@@ -78,7 +100,6 @@ SPISettings ls7366_spi(250000, MSBFIRST, SPI_MODE0);
 struct AxisMotor {
   uint8_t stepPin;
   uint8_t dirPin;
-  uint8_t enPin;
 
   volatile float speedSps;       // valore attuale step/s
   bool stepState;
@@ -86,9 +107,9 @@ struct AxisMotor {
   uint32_t nextIntervalUs;
 };
 
-AxisMotor motorX = {X_STEP_PIN, X_DIR_PIN, X_EN_PIN, 0.0f, false, 0, 0};
-AxisMotor motorY = {Y_STEP_PIN, Y_DIR_PIN, Y_EN_PIN, 0.0f, false, 0, 0};
-AxisMotor motorZ = {Z_STEP_PIN, Z_DIR_PIN, Z_EN_PIN, 0.0f, false, 0, 0};
+AxisMotor motorX = {X_STEP_PIN, X_DIR_PIN, 0.0f, false, 0, 0};
+AxisMotor motorY = {Y_STEP_PIN, Y_DIR_PIN, 0.0f, false, 0, 0};
+AxisMotor motorZ = {Z_STEP_PIN, Z_DIR_PIN, 0.0f, false, 0, 0};
 
 const size_t UART_LINE_CAPACITY = 192;
 char uartLineBuffer[UART_LINE_CAPACITY];
@@ -206,9 +227,12 @@ float autoPulsesPerMmY = 0.0f;
 float autoPulsesPerMmZ = 0.0f;
 
 IntervalTimer autoStepTimer;
+IntervalTimer autoStepReleaseTimer;
 volatile bool autoStepTimerRunning = false;
-volatile bool autoStepPulsePhase = false;
 volatile bool autoStepSegmentComplete = false;
+volatile bool autoStepReleasePending = false;
+volatile bool autoStepReleaseFault = false;
+volatile bool autoStepMainTimerNeedsPeriodUpdate = false;
 volatile uint8_t autoStepPulseMask = 0;
 volatile uint32_t autoIsrAbsDeltaX = 0;
 volatile uint32_t autoIsrAbsDeltaY = 0;
@@ -231,12 +255,43 @@ float jogZ_sps = 0.0f;
 float semiX_sps = 800.0f;
 float semiY_sps = 800.0f;
 float semiZ_sps  = 1600.0f;
+float selectedManualX_sps = 0.0f;
+float selectedManualY_sps = 0.0f;
+float selectedManualZ_sps = 0.0f;
+bool mach3ControlRequested = false;
+
+void updateControlSourceSelection();
+void processMach3Command(const char *line);
+void updateAlarmOutput();
+void updateLimits();
 
 int32_t lastGoodX = 0;
 int32_t lastGoodY = 0;
 int32_t lastGoodZ = 0;
 bool haveGoodCounters = false;
 const int32_t MAX_REASONABLE_JUMP_COUNTS = 20000;
+
+// ISR GPIO: solo flag, nessuna seriale, timer o gestione stato.
+void limitXMinusIsr() { limitPendingMask |= 0x01; }
+void limitXPlusIsr()  { limitPendingMask |= 0x02; }
+void limitYMinusIsr() { limitPendingMask |= 0x04; }
+void limitYPlusIsr()  { limitPendingMask |= 0x08; }
+void limitZTopIsr()   { limitPendingMask |= 0x10; }
+
+uint8_t readLimitMask() {
+  uint8_t mask = 0;
+  for (uint8_t i = 0; i < 5; i++) {
+    if (digitalRead(limitPins[i]) == HIGH) mask |= (1u << i);
+  }
+  return mask;
+}
+
+const char *firstLimitError(uint8_t mask) {
+  for (uint8_t i = 0; i < 5; i++) {
+    if (mask & (1u << i)) return limitErrors[i];
+  }
+  return "LIMIT_UNKNOWN";
+}
 
 // =========================
 // Utility CS
@@ -340,36 +395,24 @@ void initAxisCounter(const char* name, int cs) {
 }
 
 // =========================
-// Utility motori - open collector simulato
+// Utility motori - STEP/DIR push-pull 3,3 V verso le basi NPN
 // =========================
-void ocLow(uint8_t pin) {
+// Solo STEP/DIR: polarita GPIO invertita rispetto al precedente open collector.
+// HIGH accende l'NPN (driver a GND); LOW lo spegne (driver rilasciato).
+void driverSignalAssert(uint8_t pin) {
+  digitalWrite(pin, HIGH);
+}
+
+void driverSignalRelease(uint8_t pin) {
   digitalWrite(pin, LOW);
-  pinMode(pin, OUTPUT);
-}
-
-void ocRelease(uint8_t pin) {
-  digitalWrite(pin, LOW);
-  pinMode(pin, INPUT);
-}
-
-void ocWrite(uint8_t pin, uint8_t value) {
-  if (value == LOW) ocLow(pin);
-  else ocRelease(pin);
-}
-
-void enableMotor(AxisMotor &m, bool enable) {
-  if (ENABLE_ACTIVE_LOW) {
-    ocWrite(m.enPin, enable ? LOW : HIGH);
-  } else {
-    ocWrite(m.enPin, enable ? HIGH : LOW);
-  }
 }
 
 void initMotor(AxisMotor &m) {
-  ocRelease(m.stepPin);
-  ocRelease(m.dirPin);
-  ocRelease(m.enPin);
-  enableMotor(m, false);
+  // Precarica entrambi i latch a LOW prima di abilitare le uscite: NPN spenti.
+  driverSignalRelease(m.stepPin);
+  driverSignalRelease(m.dirPin);
+  pinMode(m.stepPin, OUTPUT);
+  pinMode(m.dirPin, OUTPUT);
 
   m.speedSps = 0.0f;
   m.stepState = false;
@@ -384,15 +427,14 @@ void setMotorSpeed(AxisMotor &m, float sps, float maxSpeedSps) {
   m.speedSps = sps;
 
   if (sps == 0.0f) {
-    ocWrite(m.stepPin, HIGH);
+    driverSignalRelease(m.stepPin);
     m.stepState = false;
     m.nextIntervalUs = 0;
-    enableMotor(m, false);
     return;
   }
 
-  ocWrite(m.dirPin, (sps >= 0.0f) ? HIGH : LOW);
-  enableMotor(m, true);
+  if (sps >= 0.0f) driverSignalRelease(m.dirPin);
+  else driverSignalAssert(m.dirPin);
 
   float absSps = fabsf(sps);
   m.nextIntervalUs = (uint32_t)(500000.0f / absSps);
@@ -408,7 +450,8 @@ void updateMotor(AxisMotor &m) {
   if ((uint32_t)(now - m.lastToggleUs) >= m.nextIntervalUs) {
     m.lastToggleUs = now;
     m.stepState = !m.stepState;
-    ocWrite(m.stepPin, m.stepState ? LOW : HIGH);
+    if (m.stepState) driverSignalAssert(m.stepPin);
+    else driverSignalRelease(m.stepPin);
   }
 }
 
@@ -473,19 +516,22 @@ uint8_t autoFifoFree() {
 }
 
 void releaseAutoStepMask(uint8_t mask) {
-  if (mask & 0x01) ocWrite(motorX.stepPin, HIGH);
-  if (mask & 0x02) ocWrite(motorY.stepPin, HIGH);
-  if (mask & 0x04) ocWrite(motorZ.stepPin, HIGH);
+  if (mask & 0x01) driverSignalRelease(motorX.stepPin);
+  if (mask & 0x02) driverSignalRelease(motorY.stepPin);
+  if (mask & 0x04) driverSignalRelease(motorZ.stepPin);
 }
 
 void stopAutoStepGeneration() {
   noInterrupts();
   autoStepTimerRunning = false;
   autoStepTimer.end();
+  autoStepReleaseTimer.end();
   uint8_t pulseMask = autoStepPulseMask;
   autoStepPulseMask = 0;
-  autoStepPulsePhase = false;
+  autoStepReleasePending = false;
   autoStepSegmentComplete = false;
+  autoStepReleaseFault = false;
+  autoStepMainTimerNeedsPeriodUpdate = false;
   autoIsrEarliestStepUs = 0;
   autoIsrLastStepStartUs = 0;
   interrupts();
@@ -508,37 +554,41 @@ void captureAutoPartialCommandedPosition() {
   autoCommandedZ = (int32_t)((int64_t)autoCommandedZ + partialZ);
 }
 
+void autoStepReleaseTimerIsr() {
+  autoStepReleaseTimer.end();
+  uint8_t pulseMask = autoStepPulseMask;
+  autoStepPulseMask = 0;
+  autoStepReleasePending = false;
+  releaseAutoStepMask(pulseMask);
+
+  if (autoIsrDominantStepIndex >= autoIsrDominantSteps) {
+    autoStepSegmentComplete = true;
+  }
+}
+
 void autoStepTimerIsr() {
+  // Guardia breve prima di ogni impulso: il loop gestisce arresto e diagnostica.
+  // La lettura diretta copre anche un IRQ GPIO ancora in attesa di servizio.
+  uint8_t limits = readLimitMask();
+  if (limits || limitPendingMask) {
+    limitPendingMask |= limits;
+    return;
+  }
+
   if (!autoStepTimerRunning) {
     autoStepTimer.end();
     return;
   }
 
-  if (!autoStepPulsePhase && autoIsrEarliestStepUs != 0) {
-    int32_t remainingUs = (int32_t)(autoIsrEarliestStepUs - micros());
-    if (remainingUs > 0) {
-      autoStepTimer.update((uint32_t)remainingUs);
-      return;
-    }
-    autoIsrEarliestStepUs = 0;
+  if (autoStepMainTimerNeedsPeriodUpdate) {
+    autoStepTimer.update(autoIsrStepIntervalUs);
+    autoStepMainTimerNeedsPeriodUpdate = false;
   }
 
-  if (autoStepPulsePhase) {
-    bool finalPulse = autoIsrDominantStepIndex >= autoIsrDominantSteps;
-    if (finalPulse) autoStepTimer.end();
-    uint8_t pulseMask = autoStepPulseMask;
-    autoStepPulseMask = 0;
-    releaseAutoStepMask(pulseMask);
-
-    if (finalPulse) {
-      autoStepPulsePhase = false;
-      autoStepTimerRunning = false;
-      autoStepSegmentComplete = true;
-      return;
-    }
-
-    autoStepPulsePhase = false;
-    autoStepTimer.update(autoIsrStepIntervalUs - STEP_PULSE_US);
+  if (autoStepReleasePending) {
+    autoStepReleaseFault = true;
+    autoStepTimerRunning = false;
+    autoStepTimer.end();
     return;
   }
 
@@ -567,12 +617,26 @@ void autoStepTimerIsr() {
 
   autoStepPulseMask = pulseMask;
   autoIsrLastStepStartUs = micros();
-  if (pulseMask & 0x01) ocWrite(motorX.stepPin, LOW);
-  if (pulseMask & 0x02) ocWrite(motorY.stepPin, LOW);
-  if (pulseMask & 0x04) ocWrite(motorZ.stepPin, LOW);
+  if (pulseMask & 0x01) driverSignalAssert(motorX.stepPin);
+  if (pulseMask & 0x02) driverSignalAssert(motorY.stepPin);
+  if (pulseMask & 0x04) driverSignalAssert(motorZ.stepPin);
   autoIsrDominantStepIndex++;
-  autoStepPulsePhase = true;
-  autoStepTimer.update(STEP_PULSE_US);
+  autoStepReleasePending = true;
+
+  if (!autoStepReleaseTimer.begin(autoStepReleaseTimerIsr, STEP_PULSE_US)) {
+    autoStepReleasePending = false;
+    autoStepReleaseFault = true;
+    autoStepPulseMask = 0;
+    releaseAutoStepMask(pulseMask);
+    autoStepTimerRunning = false;
+    autoStepTimer.end();
+    return;
+  }
+
+  if (autoIsrDominantStepIndex >= autoIsrDominantSteps) {
+    autoStepTimerRunning = false;
+    autoStepTimer.end();
+  }
 }
 
 void clearAutoFifo() {
@@ -582,6 +646,7 @@ void clearAutoFifo() {
   autoFifoCount = 0;
   autoBufferLowReported = false;
   autoSegmentActive = false;
+  memset(&autoActiveSegment, 0, sizeof(autoActiveSegment));
   memset(&autoInterpolationPlan, 0, sizeof(autoInterpolationPlan));
 }
 
@@ -603,17 +668,18 @@ bool dequeueAutoSegment(MotionSegment &segment) {
 }
 
 bool autoModeActive() {
-  // STOPPED ed ERROR mantengono il blocco manuale fino a RESET esplicito.
-  return autoState != AUTO_IDLE;
+  return autoState == AUTO_BUFFERING || autoState == AUTO_RUNNING;
 }
 
 void clearManualMotionRequests() {
   jogX_sps = 0.0f;
   jogY_sps = 0.0f;
   jogZ_sps = 0.0f;
-  semiX_sps = 0.0f;
-  semiY_sps = 0.0f;
-  semiZ_sps = 0.0f;
+  // Le velocità SEMI sono configurazioni: conservarle rende subito riutilizzabili
+  // i selettori fisici quando AUTO raggiunge uno stato terminale.
+  selectedManualX_sps = 0.0f;
+  selectedManualY_sps = 0.0f;
+  selectedManualZ_sps = 0.0f;
 }
 
 void stopLegacyMotorOutputsForAuto() {
@@ -641,7 +707,53 @@ void enterAutoError(const char *code, uint32_t segmentId = 0) {
   clearManualMotionRequests();
   stopLegacyMotorOutputsForAuto();
   autoState = AUTO_ERROR;
+  updateAlarmOutput();
+  // Un errore arresta il moto e restituisce subito la macchina alle sorgenti manuali.
+  updateControlSourceSelection();
   sendAutoError(autoJobId, code, segmentId);
+}
+
+void updateAlarmOutput() {
+  // Push-pull 3,3 V; Arduino: ingresso compatibile/buffer/opto unidirezionale.
+  // Non applicare mai 5 V ai GPIO Teensy. Z_TOP monitora soltanto il PAD Z.
+  digitalWrite(ALARM_OUTPUT_PIN,
+               (limitCurrentMask || limitLatchedMask || autoState == AUTO_ERROR) ? HIGH : LOW);
+}
+
+void updateLimits() {
+  noInterrupts();
+  uint8_t pending = limitPendingMask;
+  limitPendingMask = 0;
+  uint8_t raw = readLimitMask();
+  // Mantiene la guardia STEP fino all'arresto completo fuori ISR.
+  if (autoModeActive()) limitPendingMask = pending | raw;
+  interrupts();
+  uint8_t active = raw | pending;
+  uint8_t previous = limitCurrentMask;
+  uint32_t now = millis();
+  for (uint8_t i = 0; i < 5; i++) {
+    uint8_t bit = (1u << i);
+    if (active & bit) {
+      limitCurrentMask |= bit;
+      limitReleaseSinceMs[i] = now;
+    } else if ((uint32_t)(now - limitReleaseSinceMs[i]) >= LIMIT_RELEASE_DEBOUNCE_MS) {
+      limitCurrentMask &= ~bit;
+    }
+  }
+  limitLatchedMask |= limitCurrentMask;
+  if (active && autoModeActive()) {
+    limitAutoResetMask |= active;
+    enterAutoError(firstLimitError(active), autoSegmentActive ? autoActiveSegment.id : 0);
+  }
+  updateAlarmOutput();
+  uint8_t changed = previous ^ limitCurrentMask;
+  for (uint8_t i = 0; i < 5; i++) {
+    if (!(changed & (1u << i))) continue;
+    Serial1.print("LIMIT,STATE:");
+    Serial1.print(limitNames[i]);
+    Serial1.print(",ACTIVE:");
+    Serial1.println((limitCurrentMask & (1u << i)) ? 1 : 0);
+  }
 }
 
 void sendAutoAck(const char *command, uint32_t segmentId = 0) {
@@ -662,17 +774,17 @@ void sendAutoStatus() {
   uint32_t emittedY = autoIsrEmittedY;
   uint32_t emittedZ = autoIsrEmittedZ;
   uint32_t isrStepIndex = autoIsrDominantStepIndex;
-  bool timerRunning = autoStepTimerRunning;
+  bool timerRunning = autoStepTimerRunning || autoStepReleasePending;
   interrupts();
 
-  char payload[420];
+  char payload[640];
   snprintf(payload, sizeof(payload),
            "AUTO,STATUS,JOB:%s,STATE:%s,Q:%u,FREE:%u,LAST:%lu,EXEC:%u,"
            "ACTIVE:%lu,LAST_DONE:%lu,LOGICAL_RUN:0,STEP_RUN:%u,"
            "AUTO_ACTIVE:%u,MANUAL_BLOCKED:%u,"
            "CMDX:%ld,CMDY:%ld,CMDZ:%ld,PLAN:%u,DOM:%c,DOM_STEPS:%lu,"
            "STEP_US:%.3f,CALC_US:%lu,TEST_T_US:%lu,ISR_STEP:%lu,"
-           "EMITX:%lu,EMITY:%lu,EMITZ:%lu",
+           "EMITX:%lu,EMITY:%lu,EMITZ:%lu,LIMIT_CURRENT:%u,LIMIT_LATCHED:%u",
            safeAutoJob(autoJobId), autoStateName(), autoFifoCount, autoFifoFree(),
            (unsigned long)autoLastAcceptedSegmentId,
            autoSegmentActive ? 1 : 0,
@@ -688,7 +800,8 @@ void sendAutoStatus() {
            (unsigned long)autoInterpolationPlan.calculatedDurationUs,
            (unsigned long)(autoSegmentActive ? autoActiveSegment.durationUs : 0),
            (unsigned long)isrStepIndex, (unsigned long)emittedX,
-           (unsigned long)emittedY, (unsigned long)emittedZ);
+           (unsigned long)emittedY, (unsigned long)emittedZ,
+           (unsigned int)limitCurrentMask, (unsigned int)limitLatchedMask);
   sendAutoPayload(payload);
 }
 
@@ -743,13 +856,16 @@ bool prepareAutoInterpolation(const MotionSegment &segment) {
   }
 
   if (autoInterpolationPlan.deltaX != 0) {
-    ocWrite(motorX.dirPin, autoInterpolationPlan.deltaX > 0 ? HIGH : LOW);
+    if (autoInterpolationPlan.deltaX > 0) driverSignalRelease(motorX.dirPin);
+    else driverSignalAssert(motorX.dirPin);
   }
   if (autoInterpolationPlan.deltaY != 0) {
-    ocWrite(motorY.dirPin, autoInterpolationPlan.deltaY > 0 ? HIGH : LOW);
+    if (autoInterpolationPlan.deltaY > 0) driverSignalRelease(motorY.dirPin);
+    else driverSignalAssert(motorY.dirPin);
   }
   if (autoInterpolationPlan.deltaZ != 0) {
-    ocWrite(motorZ.dirPin, autoInterpolationPlan.deltaZ > 0 ? HIGH : LOW);
+    if (autoInterpolationPlan.deltaZ > 0) driverSignalRelease(motorZ.dirPin);
+    else driverSignalAssert(motorZ.dirPin);
   }
 
   if (autoInterpolationPlan.dominantSteps == 0) {
@@ -791,6 +907,7 @@ bool prepareAutoInterpolation(const MotionSegment &segment) {
 }
 
 bool startNextAutoStepSegment() {
+  updateLimits();
   if (autoState != AUTO_RUNNING || autoSegmentActive) return false;
   if (!dequeueAutoSegment(autoActiveSegment)) {
     sendAutoBufferLowIfNeeded();
@@ -816,8 +933,10 @@ bool startNextAutoStepSegment() {
   autoIsrEmittedY = 0;
   autoIsrEmittedZ = 0;
   autoStepPulseMask = 0;
-  autoStepPulsePhase = false;
   autoStepSegmentComplete = autoInterpolationPlan.dominantSteps == 0;
+  autoStepReleasePending = false;
+  autoStepReleaseFault = false;
+  autoStepMainTimerNeedsPeriodUpdate = false;
   autoIsrStepIntervalUs =
       (uint32_t)(autoInterpolationPlan.dominantStepIntervalUs + 0.5f);
   interrupts();
@@ -840,6 +959,7 @@ bool startNextAutoStepSegment() {
   noInterrupts();
   autoIsrEarliestStepUs = nowUs + firstEventDelayUs;
   autoStepTimerRunning = true;
+  autoStepMainTimerNeedsPeriodUpdate = firstEventDelayUs != autoIsrStepIntervalUs;
   interrupts();
   if (!autoStepTimer.begin(autoStepTimerIsr, firstEventDelayUs)) {
     autoStepTimerRunning = false;
@@ -852,6 +972,7 @@ bool startNextAutoStepSegment() {
 }
 
 void updateAutoStepExecution() {
+  updateLimits();
   if (autoState != AUTO_RUNNING) return;
   if (!autoSegmentActive) {
     startNextAutoStepSegment();
@@ -859,13 +980,19 @@ void updateAutoStepExecution() {
   }
 
   noInterrupts();
+  bool releaseFault = autoStepReleaseFault;
   bool segmentComplete = autoStepSegmentComplete;
   uint32_t emittedX = autoIsrEmittedX;
   uint32_t emittedY = autoIsrEmittedY;
   uint32_t emittedZ = autoIsrEmittedZ;
   uint32_t dominantStepIndex = autoIsrDominantStepIndex;
+  if (releaseFault) autoStepReleaseFault = false;
   if (segmentComplete) autoStepSegmentComplete = false;
   interrupts();
+  if (releaseFault) {
+    enterAutoError("PULSE_RELEASE", autoActiveSegment.id);
+    return;
+  }
   if (!segmentComplete) return;
 
   if (emittedX != autoInterpolationPlan.absDeltaX ||
@@ -886,6 +1013,9 @@ void updateAutoStepExecution() {
 
   if (endProgram) {
     autoState = AUTO_COMPLETED;
+    updateAlarmOutput();
+    // Il controllo AUTO viene rilasciato soltanto dopo l'ultimo STEP effettivo.
+    updateControlSourceSelection();
     sendAutoCompleted();
     return;
   }
@@ -1046,6 +1176,19 @@ bool autoJobMatches(const char *job) {
 }
 
 void processAutoCommand(const char *command, const AutoParsedFields &fields) {
+  updateLimits();
+  if (mach3ControlRequested &&
+      (strcmp(command, "BEGIN") == 0 || strcmp(command, "RUN") == 0)) {
+    sendAutoError(fields.hasJob ? fields.job : "NONE", "BUSY");
+    return;
+  }
+  if (strcmp(command, "BEGIN") == 0 || strcmp(command, "RUN") == 0) {
+    uint8_t blocked = limitCurrentMask | limitAutoResetMask;
+    if (blocked) {
+      sendAutoError(fields.hasJob ? fields.job : "NONE", firstLimitError(blocked));
+      return;
+    }
+  }
   if (strcmp(command, "BEGIN") == 0) {
     if (!fields.hasJob || !fields.hasTotalSegments || fields.totalSegments == 0 ||
         !fields.hasCurrentX || !fields.hasCurrentY || !fields.hasCurrentZ ||
@@ -1094,6 +1237,9 @@ void processAutoCommand(const char *command, const AutoParsedFields &fields) {
     autoPulsesPerMmY = fields.pulsesPerMmY;
     autoPulsesPerMmZ = fields.pulsesPerMmZ;
     autoState = AUTO_BUFFERING;
+    updateAlarmOutput();
+    // Da BEGIN AUTO possiede tutte le sorgenti di movimento.
+    updateControlSourceSelection();
     sendAutoAck("BEGIN");
     return;
   }
@@ -1119,7 +1265,12 @@ void processAutoCommand(const char *command, const AutoParsedFields &fields) {
     clearAutoFifo();
     clearManualMotionRequests();
     stopLegacyMotorOutputsForAuto();
+    // RESET cancella la memoria; un contatto ancora aperto resta in allarme.
+    limitLatchedMask = limitCurrentMask;
+    limitAutoResetMask = 0;
     autoState = AUTO_IDLE;
+    updateAlarmOutput();
+    updateControlSourceSelection();
     autoExpectedSegmentId = 1;
     autoLastAcceptedSegmentId = 0;
     autoLastCompletedSegmentId = 0;
@@ -1207,6 +1358,8 @@ void processAutoCommand(const char *command, const AutoParsedFields &fields) {
     clearManualMotionRequests();
     stopLegacyMotorOutputsForAuto();
     autoState = AUTO_RUNNING;
+    updateAlarmOutput();
+    updateControlSourceSelection();
     sendAutoAck("RUN");
     startNextAutoStepSegment();
     return;
@@ -1220,6 +1373,9 @@ void processAutoCommand(const char *command, const AutoParsedFields &fields) {
     clearManualMotionRequests();
     stopLegacyMotorOutputsForAuto();
     autoState = AUTO_STOPPED;
+    updateAlarmOutput();
+    // STOP rilascia la breakout solo dopo avere fermato e rilasciato gli STEP.
+    updateControlSourceSelection();
     sendAutoAck("STOP");
     char payload[150];
     snprintf(payload, sizeof(payload), "AUTO,STOPPED,JOB:%s,LAST:%lu,REASON:%s",
@@ -1292,7 +1448,7 @@ float extractAxisValue(const String &line, const char axisName) {
 }
 
 void processCommand(const String &line) {
-  if (autoModeActive() && (line.startsWith("JOG") || line.startsWith("SEMI"))) {
+  if ((autoModeActive() || mach3ControlRequested) && (line.startsWith("JOG") || line.startsWith("SEMI"))) {
     // AUTO mantiene la proprietà esclusiva del movimento fino a RESET.
     return;
   }
@@ -1341,6 +1497,7 @@ void processCommand(const String &line) {
 
 void readUartCommands() {
   while (Serial1.available()) {
+    updateLimits();
     char c = (char)Serial1.read();
 
     if (c == '\r') continue;
@@ -1353,8 +1510,14 @@ void readUartCommands() {
         }
       } else if (uartLineLength > 0) {
         uartLineBuffer[uartLineLength] = '\0';
+        // DEBUG TEMPORANEO: riga UART ricevuta, solo su USB.
+        Serial.print("DEBUG UART RX: [");
+        Serial.print(uartLineBuffer);
+        Serial.println("]");
         if (strncmp(uartLineBuffer, "AUTO,", 5) == 0) {
           processAutoLine(uartLineBuffer);
+        } else if (strncmp(uartLineBuffer, "MACH3,", 6) == 0) {
+          processMach3Command(uartLineBuffer);
         } else {
           // Compatibilità: JOG e SEMI continuano a usare l'interprete esistente.
           legacyUartLine = uartLineBuffer;
@@ -1392,7 +1555,118 @@ float chooseSemiAxisSpeed(float jogSpeed, uint8_t plusPin, uint8_t minusPin, flo
   return jogSpeed;
 }
 
+void initializeControlSourceSelectionPins() {
+  // Carica prima i latch con lo stato sicuro, poi abilita le uscite push-pull.
+  digitalWrite(ENABLE_X_SELECT_PIN, HIGH);
+  digitalWrite(ENABLE_Y_SELECT_PIN, HIGH);
+  digitalWrite(CONTROL_Z_SELECT_PIN, HIGH);
+  digitalWrite(MACH3_SELECT_PIN, LOW);
+  pinMode(ENABLE_X_SELECT_PIN, OUTPUT);
+  pinMode(ENABLE_Y_SELECT_PIN, OUTPUT);
+  pinMode(CONTROL_Z_SELECT_PIN, OUTPUT);
+  pinMode(MACH3_SELECT_PIN, OUTPUT);
+}
+
+void updateControlSourceSelection() {
+  bool selectX = false;
+  bool selectY = false;
+  bool selectZ = false;
+  bool selectMach3 = false;
+
+  if (autoModeActive()) {
+    // AUTO ha proprietà esclusiva di X, Y e Z da BEGIN fino allo stato terminale.
+    selectX = true;
+    selectY = true;
+    selectZ = true;
+  } else if (mach3ControlRequested) {
+    selectX = true;
+    selectY = true;
+    selectZ = true;
+    selectMach3 = true;
+  } else {
+    // Fuori da AUTO e MACH3, ogni asse segue indipendentemente la propria richiesta.
+    selectX = selectedManualX_sps != 0.0f;
+    selectY = selectedManualY_sps != 0.0f;
+    selectZ = selectedManualZ_sps != 0.0f;
+  }
+
+  digitalWrite(ENABLE_X_SELECT_PIN, selectX ? LOW : HIGH);
+  digitalWrite(ENABLE_Y_SELECT_PIN, selectY ? LOW : HIGH);
+  digitalWrite(CONTROL_Z_SELECT_PIN, selectZ ? LOW : HIGH);
+  digitalWrite(MACH3_SELECT_PIN, selectMach3 ? HIGH : LOW);
+}
+
+// Commutazione eseguita esclusivamente nel loop UART, mai in ISR.
+void processMach3Command(const char *line) {
+  // DEBUG TEMPORANEO: diagnostica RX sulla sola USB, fuori dalle ISR.
+  Serial.print("DEBUG MACH3 RX: ");
+  Serial.println(line);
+  if (strcmp(line, "MACH3,STATUS") == 0) {
+    // DEBUG TEMPORANEO: copia della risposta sulla sola USB.
+    Serial.print("DEBUG MACH3 TX: ");
+    Serial.println(mach3ControlRequested ? "MACH3,STATUS,ACTIVE:1" : "MACH3,STATUS,ACTIVE:0");
+    Serial1.println(mach3ControlRequested ? "MACH3,STATUS,ACTIVE:1" : "MACH3,STATUS,ACTIVE:0");
+    return;
+  }
+  if (strcmp(line, "MACH3,ON") == 0) {
+    if (mach3ControlRequested) {
+      // DEBUG TEMPORANEO: copia della risposta sulla sola USB.
+      Serial.print("DEBUG MACH3 TX: ");
+      Serial.println("MACH3,ACK,ACTIVE:1");
+      Serial1.println("MACH3,ACK,ACTIVE:1");
+      return;
+    }
+    updateLimits();
+    if (autoModeActive() || autoState == AUTO_ERROR) {
+      // DEBUG TEMPORANEO: copia della risposta sulla sola USB.
+      Serial.print("DEBUG MACH3 TX: ");
+      Serial.println("MACH3,ERROR,CODE:AUTO_ACTIVE");
+      Serial1.println("MACH3,ERROR,CODE:AUTO_ACTIVE");
+      return;
+    }
+    if (jogX_sps || jogY_sps || jogZ_sps ||
+        selectedManualX_sps || selectedManualY_sps || selectedManualZ_sps ||
+        motorX.speedSps || motorY.speedSps || motorZ.speedSps ||
+        semiActive(SEMI_X_PLUS_PIN) || semiActive(SEMI_X_MINUS_PIN) ||
+        semiActive(SEMI_Y_PLUS_PIN) || semiActive(SEMI_Y_MINUS_PIN)) {
+      // DEBUG TEMPORANEO: copia della risposta sulla sola USB.
+      Serial.print("DEBUG MACH3 TX: ");
+      Serial.println("MACH3,ERROR,CODE:BUSY");
+      Serial1.println("MACH3,ERROR,CODE:BUSY");
+      return;
+    }
+    clearManualMotionRequests();
+    semiX_sps = semiY_sps = 0.0f;
+    stopAutoStepGeneration();
+    stopLegacyMotorOutputsForAuto();
+    digitalWrite(ENABLE_X_SELECT_PIN, LOW);
+    digitalWrite(ENABLE_Y_SELECT_PIN, LOW);
+    digitalWrite(CONTROL_Z_SELECT_PIN, LOW);
+    delayMicroseconds(1000);
+    mach3ControlRequested = true;
+    digitalWrite(MACH3_SELECT_PIN, HIGH);
+    // DEBUG TEMPORANEO: copia della risposta sulla sola USB.
+    Serial.print("DEBUG MACH3 TX: ");
+    Serial.println("MACH3,ACK,ACTIVE:1");
+    Serial1.println("MACH3,ACK,ACTIVE:1");
+  } else if (strcmp(line, "MACH3,OFF") == 0) {
+    digitalWrite(MACH3_SELECT_PIN, LOW);
+    delayMicroseconds(1000);
+    clearManualMotionRequests();
+    mach3ControlRequested = false;
+    updateControlSourceSelection();
+    // DEBUG TEMPORANEO: copia della risposta sulla sola USB.
+    Serial.print("DEBUG MACH3 TX: ");
+    Serial.println("MACH3,ACK,ACTIVE:0");
+    Serial1.println("MACH3,ACK,ACTIVE:0");
+  }
+}
+
 void applyRequestedSpeeds() {
+  if (mach3ControlRequested) {
+    updateControlSourceSelection();
+    return;
+  }
   if (autoModeActive()) {
     // Il timer AUTO possiede STEP/DIR; il polling manuale non deve toccare le uscite.
     return;
@@ -1402,12 +1676,26 @@ void applyRequestedSpeeds() {
   float sy = chooseSemiAxisSpeed(jogY_sps, SEMI_Y_PLUS_PIN, SEMI_Y_MINUS_PIN, semiY_sps);
   float sz = jogZ_sps;
 
+  selectedManualX_sps = sx;
+  selectedManualY_sps = sy;
+  selectedManualZ_sps = sz;
+  updateControlSourceSelection();
+
   setMotorSpeed(motorX, sx, MAX_SPEED_XY_SPS);
   setMotorSpeed(motorY, sy, MAX_SPEED_XY_SPS);
   setMotorSpeed(motorZ, sz, MAX_SPEED_Z_SPS);
 }
 
 void setup() {
+  digitalWrite(ALARM_OUTPUT_PIN, LOW);
+  pinMode(ALARM_OUTPUT_PIN, OUTPUT);
+  for (uint8_t i = 0; i < 5; i++) pinMode(limitPins[i], INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(LIMIT_X_MINUS_PIN), limitXMinusIsr, RISING);
+  attachInterrupt(digitalPinToInterrupt(LIMIT_X_PLUS_PIN), limitXPlusIsr, RISING);
+  attachInterrupt(digitalPinToInterrupt(LIMIT_Y_MINUS_PIN), limitYMinusIsr, RISING);
+  attachInterrupt(digitalPinToInterrupt(LIMIT_Y_PLUS_PIN), limitYPlusIsr, RISING);
+  attachInterrupt(digitalPinToInterrupt(LIMIT_Z_TOP_PIN), limitZTopIsr, RISING);
+  initializeControlSourceSelectionPins();
   Serial.begin(115200);   // USB debug verso PC
   Serial1.begin(115200);  // UART verso Raspberry
   delay(1200);
@@ -1437,19 +1725,23 @@ void setup() {
   pinMode(SEMI_Y_PLUS_PIN, INPUT_PULLUP);
   pinMode(SEMI_Y_MINUS_PIN, INPUT_PULLUP);
 
+  updateLimits();
   Serial.println("=== PRONTO ===");
 }
 
 void loop() {
   static uint32_t lastMs = 0;
 
+  updateLimits();
   readUartCommands();
   updateAutoStepExecution();
   applyRequestedSpeeds();
 
-  updateMotor(motorX);
-  updateMotor(motorY);
-  updateMotor(motorZ);
+  if (!mach3ControlRequested) {
+    updateMotor(motorX);
+    updateMotor(motorY);
+    updateMotor(motorZ);
+  }
 
   if (millis() - lastMs >= 100) {
     lastMs = millis();
@@ -1463,13 +1755,16 @@ void loop() {
     int32_t z = acceptCounterRead(rawZ, lastGoodZ);
     haveGoodCounters = true;
 
-    // debug USB
-    Serial.print("X:");
-    Serial.print(x);
-    Serial.print(" Y:");
-    Serial.print(y);
-    Serial.print(" Z:");
-    Serial.println(z);
+    // DEBUG TEMPORANEO: disabilita il DRO USB continuo per leggere i log UART.
+    constexpr bool USB_DRO_DEBUG = false;
+    if (USB_DRO_DEBUG) {
+      Serial.print("X:");
+      Serial.print(x);
+      Serial.print(" Y:");
+      Serial.print(y);
+      Serial.print(" Z:");
+      Serial.println(z);
+    }
 
     // UART verso Raspberry
     Serial1.print("X:");

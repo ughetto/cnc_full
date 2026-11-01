@@ -220,6 +220,9 @@ class AutoJobController:
         self.send_line(encode_auto_message("STATUS", JOB=self.job_id or "STATUS"))
 
     def _dispatch_message(self, message):
+        if message.command in ("BUFFER_LOW", "COMPLETED", "STOPPED", "ERROR"):
+            self.last_status = dict(message.fields)
+
         if message.command == "ACK":
             self._handle_ack(message)
         elif message.command == "BUFFER_LOW":

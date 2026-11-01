@@ -21,6 +21,62 @@ except Exception:
     SpianaturaXYFrame = None
 
 
+def mm_to_steps_for_pulses(value_mm, pulses_per_mm):
+    return int(round(float(value_mm) * float(pulses_per_mm)))
+
+
+def segment_duration_us(start, end, feed_mm_s):
+    dx_mm = end.x - start.x
+    dy_mm = end.y - start.y
+    dz_mm = end.z - start.z
+    length_mm = math.sqrt(dx_mm * dx_mm + dy_mm * dy_mm + dz_mm * dz_mm)
+    return max(1, int(round((length_mm / feed_mm_s) * 1_000_000)))
+
+
+def build_spianatura_auto_segments(toolpath_result, current_position_mm, pulses_per_mm):
+    px, py, pz = (float(pulses_per_mm[axis]) for axis in ("X", "Y", "Z"))
+    current_x, current_y, current_z = (
+        float(current_position_mm[axis]) for axis in ("X", "Y", "Z")
+    )
+
+    segments = []
+    start = toolpath_result.initial_point
+
+    # COLLAUDO ELETTRICO ONLY:
+    # il primo segmento porta X/Y al punto INIZIO mantenendo Z alla quota corrente.
+    # Non e' una strategia sicura per uso macchina con fresa/utensile montati:
+    # manca ancora una quota sicura Z progettata esplicitamente.
+    positioning_length = math.hypot(start.x - current_x, start.y - current_y)
+    if positioning_length > 0.0:
+        feed_xy = next(
+            (segment.feed_mm_s for segment in toolpath_result.segments
+             if segment.kind in ("CUT", "STEP_OVER")),
+            toolpath_result.segments[0].feed_mm_s,
+        )
+        duration_us = max(1, int(round((positioning_length / feed_xy) * 1_000_000)))
+        segments.append(
+            AutoSegment(
+                mm_to_steps_for_pulses(start.x, px),
+                mm_to_steps_for_pulses(start.y, py),
+                mm_to_steps_for_pulses(current_z, pz),
+                float(feed_xy),
+                duration_us,
+            )
+        )
+
+    for segment in toolpath_result.segments:
+        segments.append(
+            AutoSegment(
+                mm_to_steps_for_pulses(segment.end.x, px),
+                mm_to_steps_for_pulses(segment.end.y, py),
+                mm_to_steps_for_pulses(segment.end.z, pz),
+                float(segment.feed_mm_s),
+                segment_duration_us(segment.start, segment.end, segment.feed_mm_s),
+            )
+        )
+    return segments
+
+
 class DROApp(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -63,8 +119,14 @@ class DROApp(tk.Tk):
         self.container = tk.Frame(self, bg="#101010")
         self.container.pack(fill="both", expand=True)
         self.current_frame = None
+        self.mach3_active = False
+        self.pc_control_notice = ""
+        self.pc_control_request = None
         self.auto_rx_queue = queue.Queue()
         self.auto_controller = AutoJobController(self.write_auto_line)
+        self.auto_job_source = None
+        self.auto_job_segment_count = 0
+        self.auto_job_has_positioning_segment = False
 
         self.start_serial_reader()
         self.show_main_menu()
@@ -81,6 +143,11 @@ class DROApp(tk.Tk):
         return dict(self.positions)
 
     def send_manual_command(self, data):
+        if self.mach3_motion_blocked():
+            return
+        if self.auto_controller.state != AutoJobState.IDLE:
+            return
+
         # JOG touch normale: valori in step/s.
         cmd = {"x": float(data.get("x", 0.0)),
                "y": float(data.get("y", 0.0)),
@@ -108,24 +175,24 @@ class DROApp(tk.Tk):
         self.after(50, self.manual_keepalive_task)
 
     def write_jog_command(self, cmd):
+        if self.mach3_motion_blocked():
+            return
         if self.serial_conn is None:
             return
         line = f'JOG,X:{cmd["x"]:.1f},Y:{cmd["y"]:.1f},Z:{cmd["z"]:.1f}\n'
         try:
-            with self.serial_lock:
-                self.serial_conn.write(line.encode("utf-8"))
-                self.serial_conn.flush()
+            self.write_uart(line.encode("utf-8"))
         except Exception:
             pass
 
     def write_semi_command(self, x_sps, y_sps):
+        if self.mach3_motion_blocked():
+            return
         if self.serial_conn is None:
             return
         line = f'SEMI,X:{x_sps:.1f},Y:{y_sps:.1f}\n'
         try:
-            with self.serial_lock:
-                self.serial_conn.write(line.encode("utf-8"))
-                self.serial_conn.flush()
+            self.write_uart(line.encode("utf-8"))
         except Exception:
             pass
 
@@ -133,6 +200,65 @@ class DROApp(tk.Tk):
         if self.current_frame is not None:
             self.current_frame.destroy()
             self.current_frame = None
+
+    def mach3_motion_blocked(self):
+        return self.mach3_active
+
+    def write_uart(self, payload):
+        # Trasmettitore condiviso da JOG, SEMI e dal pulsante CONTROLLO PC.
+        if self.serial_conn is None:
+            raise RuntimeError("Seriale Teensy non disponibile")
+        with self.serial_lock:
+            written = self.serial_conn.write(payload)
+            if written != len(payload):
+                raise IOError("Scrittura UART incompleta")
+            self.serial_conn.flush()
+        return written
+
+    def toggle_pc_control(self):
+        self.last_manual_cmd = {"x": 0.0, "y": 0.0, "z": 0.0}
+        self.pc_control_request = None
+        payload = b"MACH3,OFF\n" if self.mach3_active else b"MACH3,ON\n"
+        try:
+            self.write_uart(payload)
+        except Exception:
+            self.pc_control_notice = "CONTROLLO PC: errore invio UART"
+        else:
+            request = object()
+            self.pc_control_request = request
+            self.after(1000, lambda: self.pc_control_response_timeout(request))
+            self.pc_control_notice = "CONTROLLO PC: comando inviato"
+        notice = getattr(self, "pc_control_notice_label", None)
+        if notice is not None and notice.winfo_exists():
+            notice.configure(text=self.pc_control_notice)
+
+    def pc_control_response_timeout(self, request):
+        # I timer precedenti e le risposte già accodate non sovrascrivono lo stato.
+        if self.pc_control_request is not request:
+            return
+        self.pc_control_request = None
+        self.pc_control_notice = "CONTROLLO PC: nessuna risposta dal Teensy"
+        notice = getattr(self, "pc_control_notice_label", None)
+        if notice is not None and notice.winfo_exists():
+            notice.configure(text=self.pc_control_notice)
+
+    def handle_mach3_line(self, line):
+        self.pc_control_request = None
+        if line in ("MACH3,ACK,ACTIVE:1", "MACH3,ACK,ACTIVE:0"):
+            self.mach3_active = line == "MACH3,ACK,ACTIVE:1"
+            self.pc_control_notice = ("CONTROLLO PC ATTIVO" if self.mach3_active
+                                      else "CONTROLLO PC DISATTIVATO")
+            button = getattr(self, "pc_control_button", None)
+            if button is not None and button.winfo_exists():
+                button.configure(
+                    text="CONTROLLO PC ATTIVO" if self.mach3_active else "CONTROLLO PC")
+        elif line.startswith("MACH3,ERROR,CODE:"):
+            self.pc_control_notice = f"CONTROLLO PC NON ATTIVATO: {line.split('CODE:', 1)[1]}"
+        else:
+            self.pc_control_notice = line
+        notice = getattr(self, "pc_control_notice_label", None)
+        if notice is not None and notice.winfo_exists():
+            notice.configure(text=self.pc_control_notice)
 
     def show_main_menu(self):
         self.clear_current_frame()
@@ -173,18 +299,28 @@ class DROApp(tk.Tk):
         buttons_frame = tk.Frame(frame, bg="#101010")
         buttons_frame.grid(row=1, column=0)
 
-        buttons = [("manuale", self.show_manuale),
+        buttons = [("CONTROLLO PC ATTIVO" if self.mach3_active else "CONTROLLO PC",
+                    self.toggle_pc_control),
+                   ("manuale", self.show_manuale),
                    ("spianatura XY", self.show_spianatura_xy),
                    ("foro grande", None),
                    ("spianatura XZ", None),
                    ("spianatura YZ", None)]
 
         for i, (text, command) in enumerate(buttons):
-            tk.Button(buttons_frame, text=text.upper(),
+            button = tk.Button(buttons_frame, text=text.upper(),
                       command=command if command is not None else (lambda t=text: self.show_placeholder(t)),
                       font=("Arial", 24, "bold"), bg="#2d7ef7", fg="white",
                       activebackground="#4d96ff", activeforeground="white",
-                      relief="flat", bd=0, padx=30, pady=22, width=18).grid(row=i, column=0, pady=10)
+                      relief="flat", bd=0, padx=30, pady=12, width=23)
+            button.grid(row=0 if i == 0 else i + 1, column=0, pady=6)
+            if command == self.toggle_pc_control:
+                self.pc_control_button = button
+
+        self.pc_control_notice_label = tk.Label(
+            buttons_frame, text=self.pc_control_notice, font=("Arial", 12),
+            bg="#101010", fg="#f0b84b")
+        self.pc_control_notice_label.grid(row=1, column=0, pady=(0, 4))
 
         if self.using_provisional_settings:
             tk.Label(frame, text="SETTINGS: DEFAULT PROVVISORI - VERIFICARE IMPULSI/MM",
@@ -197,10 +333,11 @@ class DROApp(tk.Tk):
                   font=("Arial", 18, "bold"), bg="#2d7ef7", fg="white",
                   activebackground="#4d96ff", activeforeground="white",
                   relief="flat", bd=0, padx=18, pady=10).pack(side="left", padx=(0, 10))
-        tk.Button(test_tools, text="TEST AUTO", command=self.show_test_auto,
+        auto_button = tk.Button(test_tools, text="TEST AUTO", command=self.show_test_auto,
                   font=("Arial", 18, "bold"), bg="#aa7a18", fg="white",
                   activebackground="#c5921e", activeforeground="white",
-                  relief="flat", bd=0, padx=18, pady=10).pack(side="left")
+                  relief="flat", bd=0, padx=18, pady=10)
+        auto_button.pack(side="left")
 
         tk.Button(frame, text="ESCI", command=self.destroy, font=("Arial", 18, "bold"),
                   bg="#aa2e25", fg="white", activebackground="#c23c32",
@@ -212,11 +349,13 @@ class DROApp(tk.Tk):
     def refresh_menu_axes(self):
         if hasattr(self, "menu_value_labels") and self.current_frame is not None:
             for axis in ("X", "Y", "Z"):
-                if axis in self.menu_value_labels:
+                if axis in self.menu_value_labels and self.menu_value_labels[axis].winfo_exists():
                     self.menu_value_labels[axis].configure(text=self.positions.get(axis, "000,000"))
             self.after(100, self.refresh_menu_axes)
 
     def show_manuale(self):
+        if self.auto_controller.state != AutoJobState.IDLE:
+            return
         self.clear_current_frame()
         self.current_frame = ManualeFrame(self.container, on_back=self.show_main_menu,
                                           get_axis_values=self.get_axis_values,
@@ -232,10 +371,15 @@ class DROApp(tk.Tk):
                                                get_axis_values=self.get_axis_values,
                                                pulses_per_mm=dict(self.pulses_per_mm),
                                                using_provisional_settings=self.using_provisional_settings,
+                                               on_start=self.start_spianatura_auto_job,
+                                               on_stop=self.stop_spianatura_auto_job,
+                                               get_auto_state=self.get_auto_controller_state,
                                                bg="#101010")
         self.current_frame.pack(fill="both", expand=True)
 
     def show_settings(self):
+        if self.auto_controller.state != AutoJobState.IDLE:
+            return
         self.clear_current_frame()
         self.current_frame = SettingsFrame(
             self.container,
@@ -248,6 +392,8 @@ class DROApp(tk.Tk):
         self.current_frame.pack(fill="both", expand=True)
 
     def show_test_auto(self):
+        if self.auto_controller.state != AutoJobState.IDLE:
+            return
         self.clear_current_frame()
         self.current_frame = TestAutoFrame(
             self.container,
@@ -279,14 +425,107 @@ class DROApp(tk.Tk):
         if isinstance(self.current_frame, TestAutoFrame):
             self.current_frame.append_line(line)
             self.current_frame.refresh_state()
+        elif SpianaturaXYFrame is not None and isinstance(self.current_frame, SpianaturaXYFrame):
+            self.current_frame.update_auto_status(self.format_spianatura_auto_status(extra=line))
 
     def write_auto_line(self, line):
+        if self.mach3_motion_blocked() and line.startswith(("AUTO,BEGIN", "AUTO,RUN", "AUTO,SEG")):
+            raise RuntimeError("Moto Raspberry escluso: CONTROLLO PC attivo")
         if self.serial_conn is None:
             raise RuntimeError("Seriale Teensy non disponibile")
         with self.serial_lock:
             self.serial_conn.write(line.encode("ascii"))
             self.serial_conn.flush()
         self.append_auto_log(f"TX> {line.strip()}")
+
+    def parse_position_mm(self, axis):
+        return float(self.positions.get(axis, "000,000").replace(",", "."))
+
+    def mm_to_steps(self, axis, value_mm):
+        return mm_to_steps_for_pulses(value_mm, self.pulses_per_mm[axis])
+
+    def toolpath_to_auto_segments(self, toolpath_result):
+        return build_spianatura_auto_segments(
+            toolpath_result,
+            {
+                "X": self.parse_position_mm("X"),
+                "Y": self.parse_position_mm("Y"),
+                "Z": self.parse_position_mm("Z"),
+            },
+            self.pulses_per_mm,
+        )
+
+    def start_spianatura_auto_job(self, toolpath_result):
+        if self.serial_conn is None:
+            raise RuntimeError("Seriale Teensy non disponibile")
+        if self.auto_controller.state not in (
+            AutoJobState.IDLE,
+            AutoJobState.COMPLETED,
+            AutoJobState.STOPPED,
+            AutoJobState.ERROR,
+        ):
+            raise RuntimeError(f"AUTO già attivo nello stato {self.auto_controller.state.value}")
+
+        segments = self.toolpath_to_auto_segments(toolpath_result)
+        pulses = tuple(float(self.pulses_per_mm[axis]) for axis in ("X", "Y", "Z"))
+        current_position_mm = {
+            "X": self.parse_position_mm("X"),
+            "Y": self.parse_position_mm("Y"),
+            "Z": self.parse_position_mm("Z"),
+        }
+        current_position_steps = (
+            self.mm_to_steps("X", current_position_mm["X"]),
+            self.mm_to_steps("Y", current_position_mm["Y"]),
+            self.mm_to_steps("Z", current_position_mm["Z"]),
+        )
+        job_id = self.auto_controller.start_job(
+            segments,
+            current_position_steps=current_position_steps,
+            pulses_per_mm=pulses,
+        )
+        self.auto_job_source = "SPIANATURA_XY"
+        self.auto_job_segment_count = len(segments)
+        self.auto_job_has_positioning_segment = (
+            current_position_mm["X"] != toolpath_result.initial_point.x or
+            current_position_mm["Y"] != toolpath_result.initial_point.y
+        )
+        return f"POSIZIONAMENTO A INIZIO, poi LAVORAZIONE - Job {job_id}"
+
+    def stop_spianatura_auto_job(self):
+        if self.serial_conn is None:
+            raise RuntimeError("Seriale Teensy non disponibile")
+        if self.auto_controller.stop("GUI_SPIANATURA"):
+            return self.format_spianatura_auto_status(extra="STOP AUTO inviato")
+        return self.format_spianatura_auto_status(extra="STOP non necessario")
+
+    def format_spianatura_auto_status(self, extra=None):
+        status = self.auto_controller.last_status or {}
+        state = self.auto_controller.state.value
+        teensy_state = status.get("STATE", "-")
+        last_completed = status.get("LAST", str(self.auto_controller.last_acked_segment))
+        queue_count = status.get("Q", "-")
+        exec_flag = status.get("EXEC", "-")
+        try:
+            completed_id = int(last_completed)
+        except (TypeError, ValueError):
+            completed_id = self.auto_controller.last_acked_segment
+        phase = "LAVORAZIONE"
+        if self.auto_job_has_positioning_segment and completed_id < 1:
+            phase = "POSIZIONAMENTO A INIZIO"
+        lines = [
+            f"STATO SPIANATURA AUTO: {state}",
+            f"Fase: {phase}",
+            f"Teensy: {teensy_state} | EXEC={exec_flag} | FIFO={queue_count}",
+            f"Segmenti totali: {self.auto_job_segment_count} | ultimo completato/ACK: {last_completed}",
+            "AVVISO: posizionamento XY con Z invariata, solo collaudo elettrico a motori vuoti.",
+        ]
+        if self.auto_controller.last_error:
+            lines.append(f"Errore: {self.auto_controller.last_error}")
+        if extra:
+            lines.append(str(extra))
+        if self.using_provisional_settings:
+            lines.append("ATTENZIONE: impulsi/mm provvisori.")
+        return "\n".join(lines)
 
     def start_auto_test_move(self, delta_steps):
         if self.serial_conn is None:
@@ -353,10 +592,17 @@ class DROApp(tk.Tk):
         try:
             while True:
                 line = self.auto_rx_queue.get_nowait()
+                if line.startswith("MACH3,"):
+                    self.handle_mach3_line(line)
+                    continue
                 self.append_auto_log(f"RX< {line}")
                 self.auto_controller.handle_line(line)
                 if isinstance(self.current_frame, TestAutoFrame):
                     self.current_frame.refresh_state()
+                elif (SpianaturaXYFrame is not None and
+                      isinstance(self.current_frame, SpianaturaXYFrame) and
+                      self.auto_job_source == "SPIANATURA_XY"):
+                    self.current_frame.update_auto_status(self.format_spianatura_auto_status())
         except queue.Empty:
             pass
 
@@ -364,6 +610,10 @@ class DROApp(tk.Tk):
             self.auto_controller.tick()
         except Exception as exc:
             self.append_auto_log(f"AUTO ERROR: {exc}")
+        if (SpianaturaXYFrame is not None and
+                isinstance(self.current_frame, SpianaturaXYFrame) and
+                self.auto_job_source == "SPIANATURA_XY"):
+            self.current_frame.update_auto_status(self.format_spianatura_auto_status())
         self.after(20, self.auto_service_task)
 
     def show_placeholder(self, text):
@@ -395,8 +645,9 @@ class DROApp(tk.Tk):
                 if self.serial_conn is None:
                     time.sleep(0.2)
                     continue
-                with self.serial_lock:
-                    chunk = self.serial_conn.read(self.serial_conn.in_waiting or 1).decode(errors="ignore")
+                # Un solo reader; il lock seriale serializza esclusivamente i TX.
+                # Non trattenerlo durante read(): RX continuo può affamare il writer.
+                chunk = self.serial_conn.read(self.serial_conn.in_waiting or 1).decode(errors="ignore")
                 if not chunk:
                     time.sleep(0.01)
                     continue
@@ -415,6 +666,11 @@ class DROApp(tk.Tk):
         # Per evitare derive apparenti della quota, NON aggiorniamo un asse se
         # la riga e' incompleta, contiene caratteri sporchi o valori non interi.
         line = line.strip()
+        if line.startswith("MACH3,"):
+            # Segnala subito RX anche se Tk deve ancora consumare la queue.
+            self.pc_control_request = None
+            self.auto_rx_queue.put(line)
+            return
         if line.startswith("AUTO,"):
             self.auto_rx_queue.put(line)
             return
