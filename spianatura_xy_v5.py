@@ -1,32 +1,43 @@
 import tkinter as tk
 from keypad_numeric_overlay import ask_numeric_value
+from spianatura_toolpath import ToolpathValidationError, generate_spianatura_xy
 
 
 class SpianaturaXYFrame(tk.Frame):
     DEFAULT_VALUES = {
-        "totale spianatura [mm]": "010,000",
+        "profondità totale asportazione [mm]": "010,000",
         "diametro utensile [mm]": "010,000",
         "velocità di avanzamento [mm/s]": "005,000",
+        "velocità di affondo Z [mm/s]": "000,500",
         "profondità di passata [mm]": "000,150",
-        "sovrapposizione": "002,000",
+        "sovrapposizione [mm]": "002,000",
     }
 
-    def __init__(self, master, on_back, get_axis_values, *args, **kwargs):
+    def __init__(self, master, on_back, get_axis_values, pulses_per_mm=None,
+                 using_provisional_settings=False, on_start=None, on_stop=None,
+                 get_auto_state=None, *args, **kwargs):
         super().__init__(master, *args, **kwargs)
         self.configure(bg="#101010")
         self.on_back = on_back
         self.get_axis_values = get_axis_values
+        self.on_start = on_start
+        self.on_stop = on_stop
+        self.get_auto_state = get_auto_state
+        self.pulses_per_mm = dict(pulses_per_mm or {})
+        self.using_provisional_settings = using_provisional_settings
         self.value_labels = {}
         self.entry_vars = {}
         self.entry_widgets = {}
+        self.control_widgets = []
         self.refresh_ms = 100
 
         self.fields = [
-            "totale spianatura [mm]",
+            "profondità totale asportazione [mm]",
             "diametro utensile [mm]",
             "velocità di avanzamento [mm/s]",
+            "velocità di affondo Z [mm/s]",
             "profondità di passata [mm]",
-            "sovrapposizione",
+            "sovrapposizione [mm]",
         ]
 
         self.point_states = {
@@ -38,6 +49,10 @@ class SpianaturaXYFrame(tk.Frame):
             "fine": {"X": tk.StringVar(value="000.000"), "Y": tk.StringVar(value="000.000")},
         }
         self.point_buttons = {}
+        self.summary_var = tk.StringVar(
+            value=("COLLAUDO ELETTRICO: START posiziona XY a INIZIO mantenendo Z corrente, "
+                   "poi invia la lavorazione AUTO.")
+        )
 
         self.build_ui()
         self.apply_defaults()
@@ -98,8 +113,22 @@ class SpianaturaXYFrame(tk.Frame):
         )
         title_label.grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 24))
 
+        warning_label = tk.Label(
+            body_frame,
+            text=("AVVISO TEMPORANEO: modalità ammessa solo per collaudo elettrico a motori vuoti. "
+                  "Il posizionamento iniziale muove X/Y mantenendo Z invariata: NON è sicuro "
+                  "per uso con fresa/utensile montati."),
+            font=("Arial", 14, "bold"),
+            fg="#ffb347",
+            bg="#101010",
+            justify="left",
+            anchor="w",
+            wraplength=780,
+        )
+        warning_label.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(0, 12))
+
         left_panel = tk.Frame(body_frame, bg="#101010")
-        left_panel.grid(row=1, column=0, sticky="nw")
+        left_panel.grid(row=2, column=0, sticky="nw")
         left_panel.grid_columnconfigure(0, weight=0)
         left_panel.grid_columnconfigure(1, weight=1)
 
@@ -134,18 +163,34 @@ class SpianaturaXYFrame(tk.Frame):
 
             self.entry_vars[label_text] = var
             self.entry_widgets[label_text] = entry
+            self.control_widgets.append(entry)
 
         right_panel = tk.Frame(body_frame, bg="#101010")
-        right_panel.grid(row=1, column=1, sticky="ne", padx=(40, 10))
+        right_panel.grid(row=2, column=1, sticky="ne", padx=(40, 10))
 
         self.build_point_block(right_panel, "inizio", 0)
         self.build_point_block(right_panel, "fine", 1)
+
+        summary_label = tk.Label(
+            right_panel,
+            textvariable=self.summary_var,
+            font=("Arial", 14, "bold"),
+            fg="#cfcfcf",
+            bg="#101010",
+            justify="left",
+            anchor="nw",
+            wraplength=430,
+        )
+        summary_label.grid(row=2, column=0, sticky="ew", pady=(0, 10))
+        self.summary_label = summary_label
 
         bottom_frame = tk.Frame(self, bg="#101010", padx=20, pady=16)
         bottom_frame.grid(row=2, column=0, sticky="ew")
         bottom_frame.grid_columnconfigure(0, weight=1)
         bottom_frame.grid_columnconfigure(1, weight=0)
         bottom_frame.grid_columnconfigure(2, weight=0)
+        bottom_frame.grid_columnconfigure(3, weight=0)
+        bottom_frame.grid_columnconfigure(4, weight=0)
 
         hint_label = tk.Label(
             bottom_frame,
@@ -171,6 +216,41 @@ class SpianaturaXYFrame(tk.Frame):
             command=self.apply_defaults,
         )
         default_button.grid(row=0, column=1, padx=10)
+        self.default_button = default_button
+        self.control_widgets.append(default_button)
+
+        self.start_button = tk.Button(
+            bottom_frame,
+            text="START",
+            font=("Arial", 18, "bold"),
+            bg="#1f9d55",
+            fg="white",
+            activebackground="#27b964",
+            activeforeground="white",
+            relief="flat",
+            bd=0,
+            padx=18,
+            pady=10,
+            command=self.start_job,
+        )
+        self.start_button.grid(row=0, column=2, padx=10)
+
+        self.stop_button = tk.Button(
+            bottom_frame,
+            text="STOP",
+            font=("Arial", 18, "bold"),
+            bg="#aa2e25",
+            fg="white",
+            activebackground="#c23c32",
+            activeforeground="white",
+            relief="flat",
+            bd=0,
+            padx=18,
+            pady=10,
+            command=self.stop_job,
+            state="disabled",
+        )
+        self.stop_button.grid(row=0, column=3, padx=10)
 
         back_button = tk.Button(
             bottom_frame,
@@ -186,7 +266,8 @@ class SpianaturaXYFrame(tk.Frame):
             pady=10,
             command=self.on_back,
         )
-        back_button.grid(row=0, column=2, sticky="e")
+        back_button.grid(row=0, column=4, sticky="e")
+        self.back_button = back_button
 
     def build_point_block(self, parent, name: str, row: int):
         block = tk.Frame(
@@ -261,6 +342,136 @@ class SpianaturaXYFrame(tk.Frame):
 
     def comma_to_point(self, text: str) -> str:
         return (text or "000,000").replace(",", ".")
+
+    def parse_number(self, text: str) -> float:
+        return float((text or "").strip().replace(",", "."))
+
+    def generate_preview(self):
+        try:
+            result = self.generate_toolpath()
+        except (ValueError, ToolpathValidationError) as exc:
+            self.show_summary_error(str(exc))
+            return
+
+        self.show_toolpath_summary(result, executed=False)
+
+    def generate_toolpath(self):
+        if not all(state["locked"] for state in self.point_states.values()):
+            raise ToolpathValidationError("Bloccare sia INIZIO sia FINE prima di generare il percorso.")
+
+        return generate_spianatura_xy(
+            start_x=self.parse_number(self.point_vars["inizio"]["X"].get()),
+            start_y=self.parse_number(self.point_vars["inizio"]["Y"].get()),
+            end_x=self.parse_number(self.point_vars["fine"]["X"].get()),
+            end_y=self.parse_number(self.point_vars["fine"]["Y"].get()),
+            total_depth=self.parse_number(
+                self.entry_vars["profondità totale asportazione [mm]"].get()
+            ),
+            depth_per_pass=self.parse_number(
+                self.entry_vars["profondità di passata [mm]"].get()
+            ),
+            tool_diameter=self.parse_number(
+                self.entry_vars["diametro utensile [mm]"].get()
+            ),
+            overlap=self.parse_number(self.entry_vars["sovrapposizione [mm]"].get()),
+            feed_xy=self.parse_number(
+                self.entry_vars["velocità di avanzamento [mm/s]"].get()
+            ),
+            plunge_feed_z=self.parse_number(
+                self.entry_vars["velocità di affondo Z [mm/s]"].get()
+            ),
+        )
+
+    def show_toolpath_summary(self, result, executed=False, prefix=None):
+        settings_text = ", ".join(
+            f"{axis}={self.pulses_per_mm.get(axis, 0):g}" for axis in ("X", "Y", "Z")
+        )
+        provisional_text = " (PROVVISORI)" if self.using_provisional_settings else ""
+        header = prefix or (
+            "LAVORAZIONE AUTO INVIATA" if executed else
+            "PERCORSO OFFLINE GENERATO - NESSUN MOVIMENTO"
+        )
+        self.summary_var.set(
+            f"{header}\n"
+            f"Livelli Z: {len(result.levels_z)} | Passate/livello: {result.passes_per_level}\n"
+            f"Passate totali: {result.total_passes} | Segmenti: {result.segment_count}\n"
+            f"Inizio: X={result.initial_point.x:.3f} Y={result.initial_point.y:.3f} "
+            f"Z={result.initial_point.z:.3f}\n"
+            f"Fine taglio: X={result.final_cut_point.x:.3f} "
+            f"Y={result.final_cut_point.y:.3f} Z={result.final_cut_point.z:.3f}\n"
+            f"Profondità finale: {result.levels_z[-1]:.3f} mm | Stepover: {result.stepover_mm:.3f} mm\n"
+            f"Risalita prevista 30 mm: Z={result.final_point.z:.3f}\n"
+            f"Impulsi/mm{provisional_text}: {settings_text}"
+        )
+        self.summary_label.configure(fg="#7CFF6B")
+
+    def start_job(self):
+        try:
+            result = self.generate_toolpath()
+            if self.on_start is None:
+                self.show_toolpath_summary(result, executed=False)
+                return
+            message = self.on_start(result)
+        except (ValueError, ToolpathValidationError, RuntimeError) as exc:
+            self.show_summary_error(str(exc))
+            return
+
+        self.show_toolpath_summary(result, executed=True, prefix=message)
+        self.set_auto_running(True)
+
+    def stop_job(self):
+        if self.on_stop is None:
+            self.show_summary_error("STOP AUTO non collegato.")
+            return
+        try:
+            message = self.on_stop()
+        except RuntimeError as exc:
+            self.show_summary_error(str(exc))
+            return
+        self.update_auto_status(message)
+
+    def show_summary_error(self, message):
+        self.summary_var.set(f"ERRORE DI VALIDAZIONE\n{message}\nNessun movimento macchina.")
+        self.summary_label.configure(fg="#ff6b6b")
+
+    def set_auto_running(self, running):
+        state = "disabled" if running else "normal"
+        readonly_state = "disabled" if running else "readonly"
+        for widget in self.control_widgets:
+            try:
+                if isinstance(widget, tk.Entry):
+                    widget.configure(state=readonly_state)
+                else:
+                    widget.configure(state=state)
+            except tk.TclError:
+                pass
+        for button in self.point_buttons.values():
+            try:
+                button.configure(state=state)
+            except tk.TclError:
+                pass
+        self.start_button.configure(state=state)
+        self.stop_button.configure(state="normal" if running else "disabled")
+        self.back_button.configure(state="disabled" if running else "normal")
+
+    def update_auto_status(self, message):
+        text = str(message)
+        state = self.get_auto_state() if self.get_auto_state is not None else ""
+        if state == "COMPLETED":
+            self.summary_label.configure(fg="#7CFF6B")
+            self.set_auto_running(False)
+        elif state == "STOPPED":
+            self.summary_label.configure(fg="#ffb347")
+            self.set_auto_running(False)
+        elif state == "ERROR":
+            self.summary_label.configure(fg="#ff6b6b")
+            self.set_auto_running(False)
+        elif state in ("BEGIN_SENT", "BUFFERING", "RUN_SENT", "RUNNING", "STOPPING", "RESET_SENT"):
+            self.summary_label.configure(fg="#cfcfcf")
+            self.set_auto_running(True)
+        else:
+            self.summary_label.configure(fg="#cfcfcf")
+        self.summary_var.set(text)
 
     def sync_live_points(self, values: dict):
         live_x = self.comma_to_point(values.get("X", "000,000"))
